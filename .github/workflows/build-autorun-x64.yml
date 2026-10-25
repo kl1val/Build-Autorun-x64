@@ -1,3 +1,4 @@
+# Autorun Cloud Build Kit r2: scoped Docker Git ownership fix + reusable tools cache
 name: Build Autorun x64
 
 on:
@@ -90,6 +91,9 @@ jobs:
               "game-fixes": "f9aad4c44c2c555fb71348b1bfd8857a5e5475ca",
           }
           PACKAGER_SHA256 = "71b8a0b1b076b6dc58db0df5d1a1c455f657fcb640b6cdbdecd96149dea2a30d"
+          AMD64_SCRIPT_SHA256 = "6bfbadad877f66c6e69676cf37fb04c971da4b5f7daf4d252119a0c6d36708b6"
+          KIT_VERSION = "r2"
+          CONTAINER_GIT_DIRECTORIES = ("/work", "/work/horizon-wine/vendor/box64", "/work/horizon-wine/vendor/ffmpeg")
           FEATURES = ("amd64", "fex", "dynarec", "vulkan", "dxvk", "vkd3d")
 
 
@@ -130,17 +134,37 @@ jobs:
               if image_original.strip() != "ghcr.io/autorunhq/switch-dev:2026.10.01":
                   raise ValueError("Unexpected build image tag")
               image_path.write_text(IMAGE + "\n")
+              script_path = root / "horizon-wine/build-amd64-components.sh"
+              if sha256(script_path) != AMD64_SCRIPT_SHA256:
+                  raise ValueError("The upstream AMD64 build script changed; refusing a blind replacement")
+              script_original = script_path.read_text()
+              anchor = 'docker run --rm --network none -v "$root:/work" -w /work \\\n'
+              if script_original.count(anchor) != 1:
+                  raise ValueError("Expected one AMD64 build container")
+              # These environment entries are protected command-scope Git configuration.
+              # They exist only in this one disposable container, not in the host config.
+              git_args = f"    -e GIT_CONFIG_COUNT={len(CONTAINER_GIT_DIRECTORIES)} \\\n"
+              for index, directory in enumerate(CONTAINER_GIT_DIRECTORIES):
+                  git_args += f"    -e GIT_CONFIG_KEY_{index}=safe.directory -e GIT_CONFIG_VALUE_{index}={directory} \\\n"
+              script_modified = script_original.replace(anchor, anchor + git_args)
+              script_path.write_text(script_modified)
+              subprocess.run(["sh", "-n", str(script_path)], check=True)
               diff = "".join(difflib.unified_diff(original.splitlines(True), modified.splitlines(True),
                   fromfile="a/horizon-wine/tools/package-autorun.py", tofile="b/horizon-wine/tools/package-autorun.py"))
               diff += "".join(difflib.unified_diff(image_original.splitlines(True), (IMAGE + "\n").splitlines(True),
                   fromfile="a/horizon-wine/switch-dev.txt", tofile="b/horizon-wine/switch-dev.txt"))
+              diff += "".join(difflib.unified_diff(script_original.splitlines(True), script_modified.splitlines(True),
+                  fromfile="a/horizon-wine/build-amd64-components.sh", tofile="b/horizon-wine/build-amd64-components.sh"))
               (output / "cloud-portability.patch").write_text(diff)
               write_json(output / "source-lock.json", {
                   "autorun_repository": "https://github.com/autorunhq/autorun",
                   "autorun_revision": REVISION, "submodules": SUBMODULES, "build_image": IMAGE,
-                  "patch": "Linux packaging toolchain path; immutable container digest",
+                  "patch": "Linux packaging toolchain path; immutable container digest; scoped container Git ownership fix",
+                  "cloud_kit_version": KIT_VERSION,
+                  "container_git_directories": list(CONTAINER_GIT_DIRECTORIES),
                   "game_files_uploaded": False,
               })
+              print(f"[CLOUD_KIT] {KIT_VERSION}: applied Linux packaging and scoped container Git ownership fixes")
 
 
           def validate_runtime(archive):
@@ -276,6 +300,16 @@ jobs:
               main()
           PY
 
+      - name: Restore reusable toolchain and completed boot bundle
+        id: reusable-cache
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            autorun/horizon-wine/toolchains/llvm-mingw-20260505-ucrt-ubuntu-22.04-x86_64
+            autorun/horizon-wine/toolchains/boot-payloads/bundle
+          key: autorun-tools-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.AUTORUN_REVISION }}-2f1c7e14e601
+
       - name: Apply checked Linux packaging fix and lock image
         run: |
           set -euo pipefail
@@ -290,6 +324,26 @@ jobs:
           case "$BUILD_JOBS" in 2|4) ;; *) exit 1 ;; esac
           # Default build is x64. Do not pass --x86.
           sh build.sh --jobs "$BUILD_JOBS" 2>&1 | tee "$CLOUD_ROOT/diagnostics/build.log"
+
+      - name: Check reusable outputs even if runtime compilation failed
+        id: reusable-outputs
+        if: always()
+        run: |
+          toolchain="$GITHUB_WORKSPACE/autorun/horizon-wine/toolchains/llvm-mingw-20260505-ucrt-ubuntu-22.04-x86_64"
+          bundle="$GITHUB_WORKSPACE/autorun/horizon-wine/toolchains/boot-payloads/bundle"
+          if [[ -x "$toolchain/bin/aarch64-w64-mingw32-clang" && -s "$bundle/setup_boot_manifest.h" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save completed tools even if runtime compilation failed
+        if: always() && steps.reusable-outputs.outputs.ready == 'true' && steps.reusable-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            autorun/horizon-wine/toolchains/llvm-mingw-20260505-ucrt-ubuntu-22.04-x86_64
+            autorun/horizon-wine/toolchains/boot-payloads/bundle
+          key: autorun-tools-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.AUTORUN_REVISION }}-2f1c7e14e601
 
       - name: Validate and collect SD archives
         run: |
