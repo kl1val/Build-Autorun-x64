@@ -1,0 +1,333 @@
+name: Build Autorun x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_dlls:
+        description: "Also provide matching Windows DLLs for offline installation"
+        type: boolean
+        required: true
+        default: true
+      build_jobs:
+        description: "Compiler workers (2 uses less RAM)"
+        type: choice
+        required: true
+        default: "2"
+        options: ["2", "4"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autorun-x64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      AUTORUN_REVISION: "1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877"
+      CLOUD_ROOT: ${{ github.workspace }}/cloud-work
+      BUILD_JOBS: ${{ inputs.build_jobs }}
+      INCLUDE_DLLS: ${{ inputs.include_dlls }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare disposable GitHub runner
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          mkdir -p "$CLOUD_ROOT/diagnostics" "$CLOUD_ROOT/dist"
+          # Only unused SDKs on this disposable VM; never run on a personal host.
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends autoconf bison flex gettext pkg-config build-essential ca-certificates curl git python3 unzip zip xz-utils
+          docker info > "$CLOUD_ROOT/diagnostics/docker-info.txt"
+          df -h > "$CLOUD_ROOT/diagnostics/disk-before.txt"
+          free -h > "$CLOUD_ROOT/diagnostics/memory-before.txt"
+          free_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')
+          if (( free_kib < 25 * 1024 * 1024 )); then
+            echo "::error::Less than 25 GiB free on the runner. No compilation started."
+            exit 1
+          fi
+
+      - name: Fetch pinned Autorun and its submodules
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: autorunhq/autorun
+          ref: ${{ env.AUTORUN_REVISION }}
+          path: autorun
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install cloud helper (embedded; no other repository files needed)
+        run: |
+          mkdir -p "$CLOUD_ROOT"
+          cat > "$CLOUD_ROOT/cloud_helper.py" <<'PY'
+          #!/usr/bin/env python3
+          """Helpers embedded into the single-file GitHub Actions workflow."""
+          import argparse
+          import difflib
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import shutil
+          import subprocess
+          from zipfile import ZipFile, ZIP_DEFLATED
+
+          REVISION = "1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877"
+          IMAGE = "ghcr.io/autorunhq/switch-dev@sha256:2f1c7e14e601cbeedb5d5235ba2ac8f7083a044dccedc8542fc157b2d7899d41"
+          SUBMODULES = {
+              "horizon-dlls": "67e2303dee9191b7ce4e2d1ccb47957d15c8a98b",
+              "game-fixes": "f9aad4c44c2c555fb71348b1bfd8857a5e5475ca",
+          }
+          PACKAGER_SHA256 = "71b8a0b1b076b6dc58db0df5d1a1c455f657fcb640b6cdbdecd96149dea2a30d"
+          FEATURES = ("amd64", "fex", "dynarec", "vulkan", "dxvk", "vkd3d")
+
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with Path(path).open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      h.update(block)
+              return h.hexdigest()
+
+
+          def write_json(path, value):
+              Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+
+
+          def patch(root, output):
+              output.mkdir(parents=True, exist_ok=True)
+              actual = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+              if actual != REVISION:
+                  raise ValueError(f"Unexpected Autorun revision: {actual}")
+              for name, expected in SUBMODULES.items():
+                  actual = subprocess.check_output(["git", "-C", str(root / name), "rev-parse", "HEAD"], text=True).strip()
+                  if actual != expected:
+                      raise ValueError(f"Unexpected {name} revision: {actual}")
+              path = root / "horizon-wine/tools/package-autorun.py"
+              if sha256(path) != PACKAGER_SHA256:
+                  raise ValueError("The upstream packager changed; refusing a blind replacement")
+              original = path.read_text()
+              needle = "toolchain = horizon_wine / 'toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin'"
+              if original.count(needle) != 1:
+                  raise ValueError("Expected one macOS toolchain assignment")
+              replacement = 'toolchain = Path(os.environ["WINE_NX_LLVM_MINGW"]) / "bin"'
+              modified = original.replace(needle, replacement)
+              compile(modified, str(path), "exec")
+              path.write_text(modified)
+              image_path = root / "horizon-wine/switch-dev.txt"
+              image_original = image_path.read_text()
+              if image_original.strip() != "ghcr.io/autorunhq/switch-dev:2026.10.01":
+                  raise ValueError("Unexpected build image tag")
+              image_path.write_text(IMAGE + "\n")
+              diff = "".join(difflib.unified_diff(original.splitlines(True), modified.splitlines(True),
+                  fromfile="a/horizon-wine/tools/package-autorun.py", tofile="b/horizon-wine/tools/package-autorun.py"))
+              diff += "".join(difflib.unified_diff(image_original.splitlines(True), (IMAGE + "\n").splitlines(True),
+                  fromfile="a/horizon-wine/switch-dev.txt", tofile="b/horizon-wine/switch-dev.txt"))
+              (output / "cloud-portability.patch").write_text(diff)
+              write_json(output / "source-lock.json", {
+                  "autorun_repository": "https://github.com/autorunhq/autorun",
+                  "autorun_revision": REVISION, "submodules": SUBMODULES, "build_image": IMAGE,
+                  "patch": "Linux packaging toolchain path; immutable container digest",
+                  "game_files_uploaded": False,
+              })
+
+
+          def validate_runtime(archive):
+              with ZipFile(archive) as z:
+                  names = set()
+                  for entry in z.infolist():
+                      path = PurePosixPath(entry.filename)
+                      if path.parts[:2] != ("switch", "wine") or ".." in path.parts or "\\" in entry.filename:
+                          raise ValueError(f"Unsafe archive path: {entry.filename}")
+                      if (entry.external_attr >> 16) & 0o170000 == 0o120000:
+                          raise ValueError("Archive contains a symlink")
+                      folded = entry.filename.rstrip("/").casefold()
+                      if folded in names:
+                          raise ValueError(f"Duplicate archive path: {entry.filename}")
+                      names.add(folded)
+                  bad = z.testzip()
+                  if bad:
+                      raise ValueError(f"CRC error: {bad}")
+                  prefix = "switch/wine/"
+                  manifest = json.loads(z.read(prefix + "build-manifest.json"))
+                  if manifest.get("wine") != REVISION:
+                      raise ValueError("Runtime manifest is from another source revision")
+                  for feature in FEATURES:
+                      if manifest.get("features", {}).get(feature) is not True:
+                          raise ValueError(f"Runtime lacks {feature}")
+                  nro = z.read(prefix + "wine-nx-runtime.nro")
+                  if nro[16:20] != b"NRO0":
+                      raise ValueError("Invalid NRO header")
+                  for marker in (b"FEX-2609", b"[VKD3D] payload", b"a Vulkan surface has the screen"):
+                      if marker not in nro:
+                          raise ValueError(f"Missing binary marker: {marker!r}")
+                  if not re.search(rb"nx-amd64-(?:box64-\d+|fex-\d+)\0", nro):
+                      raise ValueError("No AMD64 build marker")
+                  hashes = manifest.get("files", {})
+                  if "wine-nx-runtime.nro" not in hashes:
+                      raise ValueError("The NRO is not covered by the upstream manifest")
+                  for name, digest in hashes.items():
+                      path = PurePosixPath(name)
+                      if path.is_absolute() or ".." in path.parts or "\\" in name:
+                          raise ValueError("Unsafe manifest member")
+                      if hashlib.sha256(z.read(prefix + name)).hexdigest() != digest:
+                          raise ValueError(f"Payload hash mismatch: {name}")
+                  if prefix + "config/settings.json" not in z.namelist():
+                      raise ValueError("This is a bare runtime, not the complete launcher package")
+                  return {"archive": Path(archive).name, "sha256": sha256(archive),
+                          "bytes": Path(archive).stat().st_size, "crc": "PASS",
+                          "upstream_manifest_hashes": len(hashes), "features": manifest["features"]}
+
+
+          INSTALL = """Autorun x64: результат облачной сборки
+
+          1. Распаковать скачанный GitHub artifact на компьютере: внутри отдельные ZIP.
+          2. Распаковать autorun-NNN.zip в КОРЕНЬ SD: получится switch/wine/.
+          3. Если есть autorun-windows-dlls.zip, распаковать его туда же, объединяя папки.
+             Иначе загрузить DLL в Autorun: Settings -> System -> Windows DLLs.
+          4. Нужны Atmosphere и запуск Homebrew Menu с полной памятью: держать R при
+             запуске установленной игры. Первоначально открыть Autorun из этого меню.
+          5. Текущий Quick setup устанавливает HOME forwarder и boot-компоненты.
+             Перед его применением сохранить имеющиеся boot-файлы/настройки Atmosphere.
+             Совместимость boot-компонентов со своей версией системы проверить отдельно.
+          6. Дальше использовать основной 39-bit HOME forwarder; для Reload НЕ 32-bit.
+          7. Наш сокращенный game/ копировать отдельно. Для примера содержимое game/ в
+             switch/wine/drive_c/games/P3R_TEST/; добавить EXE:
+             C:\\games\\P3R_TEST\\P3R\\Binaries\\Win64\\P3R.exe
+          8. Включить Verbose traces и Profiler, отключить Frame Generation.
+             Применить minimum_360p из отдельного P3R_Autorun_TitleSlice_TEST_r1.
+          9. Сохранить switch/wine/logs/autorun_runtime.log, P3R*.log, stdout/stderr.
+
+          Этот набор содержит только среду Autorun; игры в облако не загружаются.
+          CRC/хеши/признаки x64 доказывают структуру пакета, но не запуск на Switch.
+          Успешная сборка не гарантирует совместимость Persona 3 Reload.
+          Источники и локальное исправление указаны в source-lock.json и patch.
+          Документация: https://github.com/autorunhq/autorun
+          """
+
+
+          def collect(root, output, include_dlls):
+              output.mkdir(parents=True, exist_ok=True)
+              archives = list((root / "horizon-wine/build-autorun").glob("autorun-*.zip"))
+              if len(archives) != 1:
+                  raise ValueError(f"Expected one launcher archive, found {len(archives)}")
+              report = validate_runtime(archives[0])
+              shutil.copy2(archives[0], output / archives[0].name)
+              if include_dlls:
+                  source = root / "horizon-dlls"
+                  if not (source / "switch/wine/horizon-dlls/manifest.json").is_file():
+                      raise ValueError("No pinned DLL manifest")
+                  archive = output / "autorun-windows-dlls.zip"
+                  with ZipFile(archive, "w", ZIP_DEFLATED, compresslevel=6) as z:
+                      files = sorted(p for p in (source / "switch").rglob("*") if p.is_file())
+                      for path in files:
+                          if path.is_symlink():
+                              raise ValueError(f"Unexpected DLL symlink: {path}")
+                          z.write(path, path.relative_to(source))
+                      for name in ("NOTICE.md", "README.md"):
+                          z.write(source / name, "switch/wine/licenses/autorun-windows-dlls/" + name)
+                      for path in sorted((source / "LICENSES").rglob("*")):
+                          if path.is_file():
+                              z.write(path, "switch/wine/licenses/autorun-windows-dlls/" + path.relative_to(source).as_posix())
+                  with ZipFile(archive) as z:
+                      if z.testzip():
+                          raise ValueError("DLL archive CRC error")
+                      for path in files:
+                          if hashlib.sha256(z.read(path.relative_to(source).as_posix())).hexdigest() != sha256(path):
+                              raise ValueError(f"DLL archive readback mismatch: {path}")
+                  report["offline_dll_archive"] = {"file": archive.name, "bytes": archive.stat().st_size,
+                                                   "sha256": sha256(archive), "files_roundtripped": len(files)}
+              for name in ("source-lock.json", "cloud-portability.patch"):
+                  shutil.copy2(output.parent / "diagnostics" / name, output / name)
+              (output / "INSTALL_RU.txt").write_text(INSTALL)
+              report.update({"cloud_compilation_finished": True, "switch_runtime_verified": False,
+                             "p3r_boot_verified": False, "autorun_revision": REVISION})
+              write_json(output / "BUILD-REPORT.json", report)
+              files = sorted(p for p in output.iterdir() if p.is_file() and p.name != "SHA256SUMS.txt")
+              (output / "SHA256SUMS.txt").write_text("".join(f"{sha256(p)}  {p.name}\n" for p in files))
+              print(json.dumps(report, indent=2))
+
+
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument("mode", choices=("patch", "collect"))
+              parser.add_argument("root", type=Path)
+              parser.add_argument("output", type=Path)
+              parser.add_argument("--include-dlls", action="store_true")
+              args = parser.parse_args()
+              if args.mode == "patch":
+                  patch(args.root, args.output)
+              else:
+                  collect(args.root, args.output, args.include_dlls)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Apply checked Linux packaging fix and lock image
+        run: |
+          set -euo pipefail
+          python3 "$CLOUD_ROOT/cloud_helper.py" patch "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/diagnostics"
+          git -C "$GITHUB_WORKSPACE/autorun" submodule status > "$CLOUD_ROOT/diagnostics/submodules.txt"
+
+      - name: Build AMD64 + FEX + Vulkan + VKD3D
+        timeout-minutes: 300
+        working-directory: autorun
+        run: |
+          set -euo pipefail
+          case "$BUILD_JOBS" in 2|4) ;; *) exit 1 ;; esac
+          # Default build is x64. Do not pass --x86.
+          sh build.sh --jobs "$BUILD_JOBS" 2>&1 | tee "$CLOUD_ROOT/diagnostics/build.log"
+
+      - name: Validate and collect SD archives
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ "$INCLUDE_DLLS" = true ]]; then extra+=(--include-dlls); fi
+          python3 "$CLOUD_ROOT/cloud_helper.py" collect "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/dist" "${extra[@]}" 2>&1 | tee "$CLOUD_ROOT/diagnostics/package-check.log"
+          cat "$CLOUD_ROOT/dist/BUILD-REPORT.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve build diagnostics
+        if: always()
+        env:
+          BUILD_JOB_STATUS: ${{ job.status }}
+        run: |
+          mkdir -p "$CLOUD_ROOT/diagnostics"
+          printf '%s\n' "$BUILD_JOB_STATUS" > "$CLOUD_ROOT/diagnostics/job-status.txt"
+          df -h > "$CLOUD_ROOT/diagnostics/disk-after.txt"
+          for item in horizon-wine/build-switch-amd64/CMakeCache.txt horizon-wine/build-switch-amd64/switch-dev.json horizon-wine/build-wine-amd64-pe/config.log; do
+            if [[ -f "$GITHUB_WORKSPACE/autorun/$item" ]]; then
+              cp "$GITHUB_WORKSPACE/autorun/$item" "$CLOUD_ROOT/diagnostics/$(basename "$item")"
+            fi
+          done
+
+      - name: Downloadable SD package
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: autorun-x64-sd-${{ github.run_id }}
+          path: cloud-work/dist/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Downloadable logs (also on failure)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: autorun-x64-logs-${{ github.run_id }}
+          path: cloud-work/diagnostics/
+          retention-days: 7
+          if-no-files-found: warn
