@@ -1,4 +1,4 @@
-# Autorun Cloud Build Kit r2: scoped Docker Git ownership fix + reusable tools cache
+# Autorun Cloud Build Kit r3: Linux packager/verifier paths + scoped Git fix + tools cache
 name: Build Autorun x64
 
 on:
@@ -32,6 +32,7 @@ jobs:
       CLOUD_ROOT: ${{ github.workspace }}/cloud-work
       BUILD_JOBS: ${{ inputs.build_jobs }}
       INCLUDE_DLLS: ${{ inputs.include_dlls }}
+      WINE_NX_LLVM_MINGW: ${{ github.workspace }}/autorun/horizon-wine/toolchains/llvm-mingw-20260505-ucrt-ubuntu-22.04-x86_64
     defaults:
       run:
         shell: bash
@@ -92,7 +93,8 @@ jobs:
           }
           PACKAGER_SHA256 = "71b8a0b1b076b6dc58db0df5d1a1c455f657fcb640b6cdbdecd96149dea2a30d"
           AMD64_SCRIPT_SHA256 = "6bfbadad877f66c6e69676cf37fb04c971da4b5f7daf4d252119a0c6d36708b6"
-          KIT_VERSION = "r2"
+          VERIFIER_SHA256 = "58d3e1f57e992d05fb72a961309548ee3f38d1156d278731438ae5730e9d921b"
+          KIT_VERSION = "r3"
           CONTAINER_GIT_DIRECTORIES = ("/work", "/work/horizon-wine/vendor/box64", "/work/horizon-wine/vendor/ffmpeg")
           FEATURES = ("amd64", "fex", "dynarec", "vulkan", "dxvk", "vkd3d")
 
@@ -129,6 +131,22 @@ jobs:
               modified = original.replace(needle, replacement)
               compile(modified, str(path), "exec")
               path.write_text(modified)
+              verifier_path = root / "horizon-wine/tools/verify-package.py"
+              if sha256(verifier_path) != VERIFIER_SHA256:
+                  raise ValueError("The upstream package verifier changed; refusing a blind replacement")
+              verifier_original = verifier_path.read_text()
+              verifier_needle = 'readobj = root / "horizon-wine/toolchains/llvm-mingw-20260505-ucrt-macos-universal/bin/llvm-readobj"'
+              if verifier_original.count(verifier_needle) != 1 or verifier_original.count("import argparse\n") != 1:
+                  raise ValueError("Expected one verifier toolchain assignment and import anchor")
+              verifier_modified = verifier_original.replace("import argparse\n", "import argparse\nimport os\n")
+              verifier_modified = verifier_modified.replace(verifier_needle, 'readobj = Path(os.environ["WINE_NX_LLVM_MINGW"]) / "bin/llvm-readobj"')
+              compile(verifier_modified, str(verifier_path), "exec")
+              verifier_path.write_text(verifier_modified)
+              # Catch another hard-coded macOS toolchain in these packaging helpers before
+              # starting an expensive build. This scans only the pinned packaging tool set.
+              for helper_path in (root / "horizon-wine/tools").glob("*.py"):
+                  if "ucrt-macos-universal" in helper_path.read_text():
+                      raise ValueError(f"Unfixed macOS toolchain path in {helper_path.name}")
               image_path = root / "horizon-wine/switch-dev.txt"
               image_original = image_path.read_text()
               if image_original.strip() != "ghcr.io/autorunhq/switch-dev:2026.10.01":
@@ -155,16 +173,18 @@ jobs:
                   fromfile="a/horizon-wine/switch-dev.txt", tofile="b/horizon-wine/switch-dev.txt"))
               diff += "".join(difflib.unified_diff(script_original.splitlines(True), script_modified.splitlines(True),
                   fromfile="a/horizon-wine/build-amd64-components.sh", tofile="b/horizon-wine/build-amd64-components.sh"))
+              diff += "".join(difflib.unified_diff(verifier_original.splitlines(True), verifier_modified.splitlines(True),
+                  fromfile="a/horizon-wine/tools/verify-package.py", tofile="b/horizon-wine/tools/verify-package.py"))
               (output / "cloud-portability.patch").write_text(diff)
               write_json(output / "source-lock.json", {
                   "autorun_repository": "https://github.com/autorunhq/autorun",
                   "autorun_revision": REVISION, "submodules": SUBMODULES, "build_image": IMAGE,
-                  "patch": "Linux packaging toolchain path; immutable container digest; scoped container Git ownership fix",
+                  "patch": "Linux packaging and verifier toolchain paths; immutable container digest; scoped container Git ownership fix",
                   "cloud_kit_version": KIT_VERSION,
                   "container_git_directories": list(CONTAINER_GIT_DIRECTORIES),
                   "game_files_uploaded": False,
               })
-              print(f"[CLOUD_KIT] {KIT_VERSION}: applied Linux packaging and scoped container Git ownership fixes")
+              print(f"[CLOUD_KIT] {KIT_VERSION}: applied Linux packager/verifier and scoped container Git ownership fixes")
 
 
           def validate_runtime(archive):
@@ -316,6 +336,20 @@ jobs:
           python3 "$CLOUD_ROOT/cloud_helper.py" patch "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/diagnostics"
           git -C "$GITHUB_WORKSPACE/autorun" submodule status > "$CLOUD_ROOT/diagnostics/submodules.txt"
 
+      - name: Ensure Linux LLVM tools before compilation
+        run: |
+          set -euo pipefail
+          if [[ ! -x "$WINE_NX_LLVM_MINGW/bin/llvm-readobj" ]]; then
+            mkdir -p "$GITHUB_WORKSPACE/autorun/horizon-wine/toolchains"
+            curl -fL --retry 3 -o "$CLOUD_ROOT/llvm-mingw.tar.xz" https://github.com/mstorsjo/llvm-mingw/releases/download/20260505/llvm-mingw-20260505-ucrt-ubuntu-22.04-x86_64.tar.xz
+            tar -xJf "$CLOUD_ROOT/llvm-mingw.tar.xz" -C "$GITHUB_WORKSPACE/autorun/horizon-wine/toolchains"
+            rm "$CLOUD_ROOT/llvm-mingw.tar.xz"
+          fi
+          for tool in llvm-readobj arm64ec-w64-mingw32-clang aarch64-w64-mingw32-clang i686-w64-mingw32-clang x86_64-w64-mingw32-clang x86_64-w64-mingw32-windres; do
+            test -x "$WINE_NX_LLVM_MINGW/bin/$tool"
+          done
+          "$WINE_NX_LLVM_MINGW/bin/llvm-readobj" --version > "$CLOUD_ROOT/diagnostics/llvm-readobj-version.txt"
+
       - name: Build AMD64 + FEX + Vulkan + VKD3D
         timeout-minutes: 300
         working-directory: autorun
@@ -384,4 +418,21 @@ jobs:
           name: autorun-x64-logs-${{ github.run_id }}
           path: cloud-work/diagnostics/
           retention-days: 7
+          if-no-files-found: warn
+
+      - name: Explain intermediate runtime archive
+        if: always() && hashFiles('autorun/horizon-wine/build-switch-amd64/wine-nx-amd64-*.zip') != ''
+        run: |
+          printf '%s\n' 'Intermediate compiled runtime for diagnosis/recovery. This is not the complete validated SD launcher package. Use autorun-x64-sd when available.' > "$CLOUD_ROOT/INTERMEDIATE_README.txt"
+
+      - name: Preserve compiled runtime if final packaging fails
+        if: always() && hashFiles('autorun/horizon-wine/build-switch-amd64/wine-nx-amd64-*.zip') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: autorun-x64-intermediate-${{ github.run_id }}
+          path: |
+            autorun/horizon-wine/build-switch-amd64/wine-nx-amd64-*.zip
+            cloud-work/INTERMEDIATE_README.txt
+          retention-days: 7
+          compression-level: 0
           if-no-files-found: warn
