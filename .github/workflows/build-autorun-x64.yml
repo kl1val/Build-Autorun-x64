@@ -1,5 +1,5 @@
-# Native wait diagnosis for pinned Autorun 2640; NRO-only update, paired native symbols
-name: Build Autorun P3R wait diagnostic
+# Diagnostic kit r1.1: GCC fixture linkage and concurrent snapshot consistency fixes
+name: Build Autorun P3R wait diagnostic r1.1
 
 on:
   workflow_dispatch:
@@ -335,7 +335,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$CLOUD_ROOT/p3r-source"
           cat > "$CLOUD_ROOT/p3r-source/p3r_wait_diag.h" <<'P3R_FILE_0_END'
-          /* Process-local, bounded wait observations. No allocation, locks or wakeups. */
+          /* Process-local, bounded wait observations. No allocation, OS locks or wakeups. */
           #ifndef P3R_WAIT_DIAG_H
           #define P3R_WAIT_DIAG_H
           #include <stdint.h>
@@ -367,17 +367,32 @@ jobs:
               P3R_DIAG_STORE(&r->state, 2);
           }
           
-          static int p3r_diag_read(const struct p3r_diag_record *r,
+          static void p3r_diag_finish_read(struct p3r_diag_record *r)
+          {
+              uint64_t reading=3;
+              if (!__atomic_compare_exchange_n(&r->state,&reading,2,0,
+                                               __ATOMIC_RELEASE,__ATOMIC_RELAXED)) {
+                  if (reading==4) P3R_DIAG_STORE(&r->state,0);
+              }
+          }
+          
+          static int p3r_diag_read(struct p3r_diag_record *r,
                                    struct p3r_diag_snapshot *s)
           {
-              if (P3R_DIAG_LOAD(&r->state) != 2) return 0;
+              uint64_t stable=2;
+              /* Claim a snapshot briefly. Writers never wait for a history reader:
+               * event publication is dropped if busy, and a finished active wait is
+               * retired until its reader releases it. This prevents mixed generations. */
+              if (!__atomic_compare_exchange_n(&r->state,&stable,3,0,
+                                               __ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) return 0;
               s->serial = P3R_DIAG_LOAD(&r->serial);
           #define P3R_COPY(field) s->field = P3R_DIAG_LOAD(&r->field)
               P3R_COPY(tid); P3R_COPY(kind); P3R_COPY(address); P3R_COPY(expected);
               P3R_COPY(timeout_ns); P3R_COPY(object); P3R_COPY(key); P3R_COPY(caller);
               P3R_COPY(started_ns); P3R_COPY(last_rc); P3R_COPY(rounds);
           #undef P3R_COPY
-              return P3R_DIAG_LOAD(&r->state) == 2 && s->serial == P3R_DIAG_LOAD(&r->serial);
+              p3r_diag_finish_read(r);
+              return 1;
           }
           
           static int p3r_diag_begin(const struct p3r_diag_snapshot *s)
@@ -406,7 +421,7 @@ jobs:
               uint64_t index = __atomic_fetch_add(&p3r_diag_event_cursor, 1, __ATOMIC_RELAXED);
               struct p3r_diag_record *r = p3r_diag_events + index % P3R_DIAG_SLOTS;
               uint64_t state = P3R_DIAG_LOAD(&r->state);
-              if (state == 1 || !__atomic_compare_exchange_n(&r->state, &state,
+              if ((state != 0 && state != 2) || !__atomic_compare_exchange_n(&r->state, &state,
                                       1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
                   __atomic_add_fetch(&p3r_diag_dropped, 1, __ATOMIC_RELAXED);
                   return;
@@ -421,8 +436,14 @@ jobs:
               if (p3r_diag_read(p3r_diag_waits + slot, &s)) {
                   s.kind += 16; s.last_rc = rc; s.started_ns = now_ns;
                   p3r_diag_event(&s);
+              } else __atomic_add_fetch(&p3r_diag_dropped,1,__ATOMIC_RELAXED);
+              for (;;) {
+                  uint64_t state=P3R_DIAG_LOAD(&p3r_diag_waits[slot].state);
+                  uint64_t next=state==3 ? 4 : 0;
+                  if (state!=2 && state!=3) break;
+                  if (__atomic_compare_exchange_n(&p3r_diag_waits[slot].state,&state,next,0,
+                                                  __ATOMIC_RELEASE,__ATOMIC_RELAXED)) break;
               }
-              P3R_DIAG_STORE(&p3r_diag_waits[slot].state, 0);
           }
           #endif
           P3R_FILE_0_END
@@ -699,6 +720,7 @@ jobs:
           import importlib.util
           import json
           import os
+          import sys
           from pathlib import Path
           import subprocess
           
@@ -709,6 +731,7 @@ jobs:
           
           def check(root, source, output):
               output.mkdir(parents=True,exist_ok=True)
+              assert (root/'horizon-wine/source/p3r_wait_diag.h').read_bytes()==(source/'p3r_wait_diag.h').read_bytes(), 'Patched header differs from tested source'
               patcher=load_module('patcher',source/'patch_runtime.py')
               symbol=load_module('symbol',source/'symbolicate_profile.py')
               horizon=(root/'dlls/ntdll/unix/horizon.c').read_text()
@@ -718,14 +741,33 @@ jobs:
                   '#include "../../../horizon-wine/source/p3r_wait_diag.h"','#include "p3r_wait_diag.h"'
               ).replace('void horizon_p3r_report_waits(void)','static void horizon_p3r_report_waits(void)')
               wrapper=output/'futex_wrapper.c'
-              wrapper.write_text((source/'futex_test_prefix.h').read_text()+helper+horizon[begin:end]+(source/'futex_test_main.inc').read_text())
+              native_wrapper=horizon[begin:end]
+              if sys.platform=='darwin':
+                  # Mach-O uses weak_import for an optional undefined symbol; Horizon and
+                  # Linux use ELF weak declarations. Keep the wait body/conditions intact.
+                  native_wrapper=native_wrapper.replace('__attribute__((weak))','P3R_TEST_WEAK')
+              wrapper.write_text((source/'futex_test_prefix.h').read_text()+helper+native_wrapper+(source/'futex_test_main.inc').read_text())
+              # Keep definitions in a separate translation unit, like Autorun itself.
+              # GCC otherwise knows the weak addresses are non-null and emits -Waddress.
+              quit_stubs=output/'quit_stubs.c'
+              quit_stubs.write_text('volatile int wine_nx_quit_requested;\n'
+                                    'void wine_nx_quit_point(void) { wine_nx_quit_requested=0; }\n')
               cc=os.environ.get('CC','cc')
+              compiler_version=subprocess.check_output([cc,'--version'],text=True).splitlines()[0]
               results=[]
-              for name, file in [('wait_registry',source/'test_wait_diag.c'),('futex_wrapper',wrapper)]:
+              for name, files in [('wait_registry',[source/'test_wait_diag.c']),
+                                  ('futex_wrapper_hooks_present',[wrapper,quit_stubs]),
+                                  ('futex_wrapper_hooks_absent',[wrapper])]:
                   binary=output/name
-                  subprocess.run([cc,'-std=c11','-O2','-Wall','-Wextra','-Werror','-pthread','-I',str(source),str(file),'-o',str(binary)],check=True)
+                  linker=[]
+                  if sys.platform=='darwin' and name=='futex_wrapper_hooks_absent':
+                      # Mach-O needs an explicit dynamic lookup binding for a weak symbol
+                      # with no providing dylib. These two symbols remain optional only.
+                      linker=['-Wl,-U,_wine_nx_quit_requested','-Wl,-U,_wine_nx_quit_point']
+                  subprocess.run([cc,'-std=c11','-O2','-Wall','-Wextra','-Werror','-pthread','-I',str(source),
+                                  *map(str,files),*linker,'-o',str(binary)],check=True)
                   result=subprocess.check_output([str(binary)],text=True).strip()
-                  print(result);results.append(result)
+                  print(name+': '+result);results.append(name+': '+result)
               # Exercise the actual scheduling expression extracted from the patched source.
               runtime=(root/'horizon-wine/source/runtime.c').read_text()
               assert 'if ((quiet >= 2 && reported < 3) || (quiet >= 6 && !(quiet % 6)))' in runtime
@@ -752,7 +794,7 @@ jobs:
               else:raise AssertionError('Second patch unexpectedly accepted')
               assert before=={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in patcher.LOCKS}
               results.append('PASS: duplicate or changed upstream sources are rejected without writes')
-              report={'host_checks':'PASS','checks':results,'snapshot_seconds':snapshots,'switch_runtime_verified':False,'p3r_boot_verified':False}
+              report={'host_checks':'PASS','compiler':compiler_version,'checks':results,'snapshot_seconds':snapshots,'switch_runtime_verified':False,'p3r_boot_verified':False}
               (output/'HOST-CHECKS.json').write_text(json.dumps(report,indent=2)+'\n')
               print('PASS: all host checks; Switch compilation and execution remain unverified')
           
@@ -800,6 +842,20 @@ jobs:
                   p3r_diag_end(slots[i], 0, 1);
                   assert(!p3r_diag_read(p3r_diag_waits+slots[i], &read));
               }
+              /* Ending a wait during a snapshot must defer reuse until read completion. */
+              {
+                  int slot=p3r_diag_begin(&s), other;
+                  uint64_t stable=2;
+                  assert(slot>=0);
+                  assert(__atomic_compare_exchange_n(&p3r_diag_waits[slot].state,&stable,3,
+                                                      0,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED));
+                  p3r_diag_end(slot,0,2);
+                  assert(P3R_DIAG_LOAD(&p3r_diag_waits[slot].state)==4);
+                  other=p3r_diag_begin(&s);assert(other>=0 && other!=slot);
+                  p3r_diag_finish_read(p3r_diag_waits+slot);
+                  assert(P3R_DIAG_LOAD(&p3r_diag_waits[slot].state)==0);
+                  p3r_diag_end(other,0,3);
+              }
               for (i=0; i<8; ++i) assert(!pthread_create(writers+i, NULL, writer, (void *)(uintptr_t)(i+1)));
               while (P3R_DIAG_LOAD(&done)!=8) {
                   for (i=0; i<P3R_DIAG_SLOTS; ++i) {
@@ -845,9 +901,13 @@ jobs:
           static uint64_t armTicksToNs(uint64_t n){return n;}
           static Result svcQueryMemory(MemoryInfo *i,u32 *p,u64 a){(void)i;(void)p;(void)a;return 1;}
           static unsigned log_lines;static void wine_nx_runtime_trace(const char *s){assert(s);log_lines++;}
-          volatile int wine_nx_quit_requested;
-          void wine_nx_quit_point(void) __attribute__((weak));
-          void wine_nx_quit_point(void) {wine_nx_quit_requested=0;}
+          #ifdef __APPLE__
+          #define P3R_TEST_WEAK __attribute__((weak_import))
+          #else
+          #define P3R_TEST_WEAK __attribute__((weak))
+          #endif
+          extern volatile int wine_nx_quit_requested P3R_TEST_WEAK;
+          extern void wine_nx_quit_point(void) P3R_TEST_WEAK;
           static Result answers[8];static int called;static long long received[8];
           static void horizon_p3r_report_waits(void);
           static Result svcWaitForAddress(void *a,unsigned arb,long long v,long long t){
@@ -875,6 +935,14 @@ jobs:
            for(i=0;i<P3R_DIAG_SLOTS;i++)if(p3r_diag_read(p3r_diag_events+i,&s)&&s.kind==32){
             assert(s.last_rc==77 && s.expected==3 && s.address==(uintptr_t)&word);seen++;}
            assert(seen==1);
+           if (&wine_nx_quit_requested && &wine_nx_quit_point) {
+            wine_nx_quit_requested=1;called=0;answers[0]=0;
+            assert(horizon_futex_wait(&word,0,-1)==0 && wine_nx_quit_requested==0);
+            puts("PASS: separately linked quit hooks are called");
+           } else {
+            assert(!&wine_nx_quit_requested && !&wine_nx_quit_point);
+            puts("PASS: missing weak quit hooks are skipped safely");
+           }
            puts("PASS: unchanged infinite slices, finite timeout, success, EAGAIN, ETIMEDOUT, EINVAL; active capture and wake kernel result");return 0;}
           P3R_FILE_5_END
           cat > "$CLOUD_ROOT/p3r-source/symbolicate_profile.py" <<'P3R_FILE_6_END'
