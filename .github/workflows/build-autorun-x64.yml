@@ -1,14 +1,9 @@
-# Autorun Cloud Build Kit r3: Linux packager/verifier paths + scoped Git fix + tools cache
-name: Build Autorun x64
+# Native wait diagnosis for pinned Autorun 2640; NRO-only update, paired native symbols
+name: Build Autorun P3R wait diagnostic
 
 on:
   workflow_dispatch:
     inputs:
-      include_dlls:
-        description: "Also provide matching Windows DLLs for offline installation"
-        type: boolean
-        required: true
-        default: true
       build_jobs:
         description: "Compiler workers (2 uses less RAM)"
         type: choice
@@ -20,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: autorun-x64-${{ github.ref }}
+  group: autorun-p3r-diag-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,7 +26,6 @@ jobs:
       AUTORUN_REVISION: "1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877"
       CLOUD_ROOT: ${{ github.workspace }}/cloud-work
       BUILD_JOBS: ${{ inputs.build_jobs }}
-      INCLUDE_DLLS: ${{ inputs.include_dlls }}
       WINE_NX_LLVM_MINGW: ${{ github.workspace }}/autorun/horizon-wine/toolchains/llvm-mingw-20260505-ucrt-ubuntu-22.04-x86_64
     defaults:
       run:
@@ -336,6 +330,703 @@ jobs:
           python3 "$CLOUD_ROOT/cloud_helper.py" patch "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/diagnostics"
           git -C "$GITHUB_WORKSPACE/autorun" submodule status > "$CLOUD_ROOT/diagnostics/submodules.txt"
 
+      - name: Install and apply pinned native wait instrumentation
+        run: |
+          set -euo pipefail
+          mkdir -p "$CLOUD_ROOT/p3r-source"
+          cat > "$CLOUD_ROOT/p3r-source/p3r_wait_diag.h" <<'P3R_FILE_0_END'
+          /* Process-local, bounded wait observations. No allocation, locks or wakeups. */
+          #ifndef P3R_WAIT_DIAG_H
+          #define P3R_WAIT_DIAG_H
+          #include <stdint.h>
+          #define P3R_DIAG_SLOTS 64
+          #define P3R_DIAG_LOAD(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+          #define P3R_DIAG_STORE(p,v) __atomic_store_n((p),(v),__ATOMIC_RELEASE)
+          
+          struct p3r_diag_record {
+              uint64_t state, serial, tid, kind, address, expected, timeout_ns;
+              uint64_t object, key, caller, started_ns, last_rc, rounds;
+          };
+          struct p3r_diag_snapshot {
+              uint64_t serial, tid, kind, address, expected, timeout_ns;
+              uint64_t object, key, caller, started_ns, last_rc, rounds;
+          };
+          static struct p3r_diag_record p3r_diag_waits[P3R_DIAG_SLOTS];
+          static struct p3r_diag_record p3r_diag_events[P3R_DIAG_SLOTS];
+          static uint64_t p3r_diag_serial, p3r_diag_event_cursor, p3r_diag_dropped;
+          
+          static void p3r_diag_publish(struct p3r_diag_record *r,
+                                      const struct p3r_diag_snapshot *s)
+          {
+              P3R_DIAG_STORE(&r->serial, __atomic_add_fetch(&p3r_diag_serial, 1, __ATOMIC_RELAXED));
+          #define P3R_COPY(field) P3R_DIAG_STORE(&r->field, s->field)
+              P3R_COPY(tid); P3R_COPY(kind); P3R_COPY(address); P3R_COPY(expected);
+              P3R_COPY(timeout_ns); P3R_COPY(object); P3R_COPY(key); P3R_COPY(caller);
+              P3R_COPY(started_ns); P3R_COPY(last_rc); P3R_COPY(rounds);
+          #undef P3R_COPY
+              P3R_DIAG_STORE(&r->state, 2);
+          }
+          
+          static int p3r_diag_read(const struct p3r_diag_record *r,
+                                   struct p3r_diag_snapshot *s)
+          {
+              if (P3R_DIAG_LOAD(&r->state) != 2) return 0;
+              s->serial = P3R_DIAG_LOAD(&r->serial);
+          #define P3R_COPY(field) s->field = P3R_DIAG_LOAD(&r->field)
+              P3R_COPY(tid); P3R_COPY(kind); P3R_COPY(address); P3R_COPY(expected);
+              P3R_COPY(timeout_ns); P3R_COPY(object); P3R_COPY(key); P3R_COPY(caller);
+              P3R_COPY(started_ns); P3R_COPY(last_rc); P3R_COPY(rounds);
+          #undef P3R_COPY
+              return P3R_DIAG_LOAD(&r->state) == 2 && s->serial == P3R_DIAG_LOAD(&r->serial);
+          }
+          
+          static int p3r_diag_begin(const struct p3r_diag_snapshot *s)
+          {
+              unsigned i;
+              for (i = 0; i < P3R_DIAG_SLOTS; ++i) {
+                  uint64_t available = 0;
+                  if (!__atomic_compare_exchange_n(&p3r_diag_waits[i].state, &available,
+                                                  1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+                  p3r_diag_publish(p3r_diag_waits + i, s);
+                  return (int)i;
+              }
+              __atomic_add_fetch(&p3r_diag_dropped, 1, __ATOMIC_RELAXED);
+              return -1;
+          }
+          
+          static void p3r_diag_round(int slot, uint64_t rc)
+          {
+              if (slot < 0) return;
+              P3R_DIAG_STORE(&p3r_diag_waits[slot].last_rc, rc);
+              __atomic_add_fetch(&p3r_diag_waits[slot].rounds, 1, __ATOMIC_RELAXED);
+          }
+          
+          static void p3r_diag_event(const struct p3r_diag_snapshot *s)
+          {
+              uint64_t index = __atomic_fetch_add(&p3r_diag_event_cursor, 1, __ATOMIC_RELAXED);
+              struct p3r_diag_record *r = p3r_diag_events + index % P3R_DIAG_SLOTS;
+              uint64_t state = P3R_DIAG_LOAD(&r->state);
+              if (state == 1 || !__atomic_compare_exchange_n(&r->state, &state,
+                                      1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                  __atomic_add_fetch(&p3r_diag_dropped, 1, __ATOMIC_RELAXED);
+                  return;
+              }
+              p3r_diag_publish(r, s);
+          }
+          
+          static void p3r_diag_end(int slot, uint64_t rc, uint64_t now_ns)
+          {
+              struct p3r_diag_snapshot s;
+              if (slot < 0) return;
+              if (p3r_diag_read(p3r_diag_waits + slot, &s)) {
+                  s.kind += 16; s.last_rc = rc; s.started_ns = now_ns;
+                  p3r_diag_event(&s);
+              }
+              P3R_DIAG_STORE(&p3r_diag_waits[slot].state, 0);
+          }
+          #endif
+          P3R_FILE_0_END
+          cat > "$CLOUD_ROOT/p3r-source/patch_runtime.py" <<'P3R_FILE_1_END'
+          #!/usr/bin/env python3
+          """Instrument only the pinned Autorun native runtime; leave wait semantics intact."""
+          import argparse
+          import difflib
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+          
+          LOCKS = {
+              'horizon-wine/source/runtime.c': '8713cf9da29ee6694c80dcb7b580bdac4efe09508e8e06c1e742b97e0bcb1301',
+              'horizon-wine/source/thread_profile.c': '36b3acde20566faa29ee1ba364bae1520ebbf1a3772a707df30a9598b31a324b',
+              'dlls/ntdll/unix/horizon.c': '9fc65b2a415b43db4cef7ba8d8f0ef0c927584ab9cc921ab676381d8317ced0d',
+              'dlls/ntdll/unix/sync.c': 'd3baa74b0fbeb7bcd180315015eaa999f20aeeec6e6b2114ee46a25fa4d7083e',
+          }
+          
+          NATIVE_HELPERS = r'''
+          #include "../../../horizon-wine/source/p3r_wait_diag.h"
+          static __thread unsigned p3r_wait_kind;
+          static __thread uintptr_t p3r_wait_object, p3r_wait_key;
+          
+          void horizon_p3r_wait_context( unsigned kind, uintptr_t object, uintptr_t key )
+          {
+              p3r_wait_kind = kind;
+              p3r_wait_object = object;
+              p3r_wait_key = key;
+          }
+          
+          static uint64_t p3r_diag_tid(void)
+          {
+              struct thread_data *data = get_thread_data();
+              return data ? data->tid : 0;
+          }
+          
+          static uint64_t p3r_diag_now(void)
+          {
+              return armTicksToNs( armGetSystemTick() );
+          }
+          
+          /* Advisory lock word only. Never dereference an unmapped or crossing range. */
+          static int p3r_diag_word( uint64_t address, uint64_t *value )
+          {
+              MemoryInfo info;
+              u32 page;
+              if (!address || address > UINT64_MAX - sizeof(*value) ||
+                  R_FAILED( svcQueryMemory( &info, &page, address ) ) || !(info.perm & Perm_R) ||
+                  address < info.addr || info.size < sizeof(*value) ||
+                  address - info.addr > info.size - sizeof(*value)) return 0;
+              memcpy( value, (const void *)(uintptr_t)address, sizeof(*value) );
+              return 1;
+          }
+          
+          void horizon_p3r_report_waits(void)
+          {
+              struct p3r_diag_snapshot current, events[P3R_DIAG_SLOTS], swap;
+              uint64_t now = p3r_diag_now(), word, base = 0, last = 0;
+              static uint64_t last_events;
+              unsigned i, j, count = 0, active = 0;
+              MemoryInfo info;
+              u32 page;
+              char line[720];
+          
+              if (R_SUCCEEDED( svcQueryMemory( &info, &page, (u64)(uintptr_t)&horizon_p3r_report_waits ) ))
+                  base = info.addr;
+              for (i = 0; i < P3R_DIAG_SLOTS; ++i) {
+                  if (!p3r_diag_read( p3r_diag_waits + i, &current ) ||
+                      now < current.started_ns || now - current.started_ns < 1000000000ULL) continue;
+                  active++;
+                  snprintf( line, sizeof(line),
+                            "[P3R-WAIT] tid=%llu kind=%llu addr=%#llx expected=%#llx timeout_ns=%lld "
+                            "age_ms=%llu key=%#llx object=%#llx caller=%#llx native_base=%#llx "
+                            "caller_offset=%#llx rounds=%llu last_rc=%#llx",
+                            (unsigned long long)current.tid, (unsigned long long)current.kind,
+                            (unsigned long long)current.address, (unsigned long long)current.expected,
+                            (long long)current.timeout_ns, (unsigned long long)((now-current.started_ns)/1000000),
+                            (unsigned long long)current.key, (unsigned long long)current.object,
+                            (unsigned long long)current.caller, (unsigned long long)base,
+                            (unsigned long long)(base && current.caller >= base ? current.caller-base : 0),
+                            (unsigned long long)current.rounds, (unsigned long long)current.last_rc );
+                  wine_nx_runtime_trace( line );
+                  if (p3r_diag_word( current.key, &word )) {
+                      snprintf( line, sizeof(line), "[P3R-WAIT-WORD] tid=%llu key=%#llx word64=%#llx",
+                                (unsigned long long)current.tid, (unsigned long long)current.key,
+                                (unsigned long long)word );
+                      wine_nx_runtime_trace( line );
+                  }
+                  /* Retained wake requests for this address, including kernel result. */
+                  for (j = 0; j < P3R_DIAG_SLOTS; ++j) {
+                      struct p3r_diag_snapshot wake;
+                      if (!p3r_diag_read( p3r_diag_events + j, &wake ) || wake.kind != 32 ||
+                          wake.address != current.address) continue;
+                      snprintf( line, sizeof(line),
+                                "[P3R-WAKE-MATCH] waiter=%llu waker=%llu count=%llu rc=%#llx "
+                                "when_ns=%llu wait_start_ns=%llu",
+                                (unsigned long long)current.tid, (unsigned long long)wake.tid,
+                                (unsigned long long)wake.expected, (unsigned long long)wake.last_rc,
+                                (unsigned long long)wake.started_ns, (unsigned long long)current.started_ns );
+                      wine_nx_runtime_trace( line );
+                  }
+              }
+              if (!active) return;
+              for (i = 0; i < P3R_DIAG_SLOTS; ++i)
+                  if (p3r_diag_read( p3r_diag_events + i, events + count ) && events[count].serial > last_events)
+                      count++;
+              for (i = 1; i < count; ++i)
+                  for (j = i; j && events[j-1].serial > events[j].serial; --j) {
+                      swap = events[j-1]; events[j-1] = events[j]; events[j] = swap;
+                  }
+              for (i = count > 16 ? count-16 : 0; i < count; ++i) {
+                  struct p3r_diag_snapshot *s = events + i;
+                  snprintf( line, sizeof(line),
+                            "[P3R-WAIT-EVENT] serial=%llu tid=%llu kind=%llu addr=%#llx "
+                            "key=%#llx count_or_expected=%#llx rc=%#llx when_ns=%llu",
+                            (unsigned long long)s->serial, (unsigned long long)s->tid,
+                            (unsigned long long)s->kind, (unsigned long long)s->address,
+                            (unsigned long long)s->key, (unsigned long long)s->expected,
+                            (unsigned long long)s->last_rc, (unsigned long long)s->started_ns );
+                  wine_nx_runtime_trace( line );
+                  last = s->serial;
+              }
+              if (last) last_events = last;
+              snprintf( line, sizeof(line), "[P3R-WAIT-SUMMARY] active=%u dropped=%llu (bounded history)",
+                        active, (unsigned long long)P3R_DIAG_LOAD(&p3r_diag_dropped) );
+              wine_nx_runtime_trace( line );
+          }
+          
+          '''
+          
+          def replace_once(text, before, after):
+              if text.count(before) != 1:
+                  raise ValueError(f'Expected one patch anchor: {before[:110]!r}; got {text.count(before)}')
+              return text.replace(before, after, 1)
+          
+          def patch(root, header, output, build_id='local-test'):
+              if not re.fullmatch(r'[A-Za-z0-9-]{1,64}', build_id):
+                  raise ValueError('Unsafe diagnostic build identifier')
+              originals = {}
+              for name, digest in LOCKS.items():
+                  b = (root / name).read_bytes()
+                  if hashlib.sha256(b).hexdigest() != digest:
+                      raise ValueError(f'Source mismatch: {name}; refusing an unreviewed patch')
+                  originals[name] = b.decode()
+              modified = dict(originals)
+              runtime = modified['horizon-wine/source/runtime.c']
+              runtime = replace_once(runtime, 'if (quiet >= 2 && reported < 3)',
+                                     'if ((quiet >= 2 && reported < 3) || (quiet >= 6 && !(quiet % 6)))')
+              runtime = replace_once(runtime, 'const char *tso = "0", *multiblock = "1", *maxinst = "1000";',
+                                     'const char *tso = "0", *multiblock = "1", *maxinst = "1000", *smc = "none";')
+              runtime = replace_once(runtime, '    log_line( "[FEX] TSO=%s multiblock=%s maxinst=%s", tso, multiblock, maxinst );',
+                                     '    if (launcher_kv_get( &kv, "FEX_SMCCHECKS", configured, sizeof(configured) ) &&\n'
+                                     '        nx_fex_option_choice( nx_fex_options + NX_FEX_SMC, configured ) >= 0) smc = configured;\n'
+                                     '    log_line( "[FEX] TSO=%s multiblock=%s maxinst=%s SMC=%s", tso, multiblock, maxinst, smc );')
+              runtime = replace_once(runtime, '            wine_nx_thread_report();',
+                                     '            wine_nx_thread_report();\n'
+                                     '            { extern void horizon_p3r_report_waits(void); horizon_p3r_report_waits(); }')
+              runtime = replace_once(runtime, '    log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );',
+                                     '    log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );\n'
+                                     f'    log_line( "[P3R-DIAG] wait-snapshot-r1 id={build_id}; native observation only" );')
+              modified['horizon-wine/source/runtime.c'] = runtime
+          
+              horizon = modified['dlls/ntdll/unix/horizon.c']
+              anchor = "/* Address arbitration (4.0.0+) is Horizon's futex: WaitIfEqual compares and"
+              horizon = replace_once(horizon, anchor, NATIVE_HELPERS + anchor)
+              start = horizon.index('int horizon_futex_wait( const int *addr, int value, long long timeout_ns )')
+              end = horizon.index('/* Monotonic time since boot', start)
+              part = horizon[start:end]
+              part = replace_once(part, '    Result rc;\n',
+                  '    Result rc;\n'
+                  '    struct p3r_diag_snapshot observed = {0};\n'
+                  '    int diagnostic_slot;\n'
+                  '    observed.tid = p3r_diag_tid(); observed.kind = p3r_wait_kind;\n'
+                  '    observed.address = (uintptr_t)addr; observed.expected = (uint32_t)value;\n'
+                  '    observed.timeout_ns = (uint64_t)timeout_ns;\n'
+                  '    observed.object = p3r_wait_object; observed.key = p3r_wait_key;\n'
+                  '    observed.caller = (uintptr_t)__builtin_return_address(0);\n'
+                  '    observed.started_ns = p3r_diag_now(); observed.last_rc = 0xffffffff;\n'
+                  '    diagnostic_slot = p3r_diag_begin( &observed );\n')
+              part = replace_once(part, '                                timeout_ns < 0 ? slice : timeout_ns );',
+                  '                                timeout_ns < 0 ? slice : timeout_ns );\n'
+                  '        p3r_diag_round( diagnostic_slot, rc );')
+              part = replace_once(part, '    if (R_SUCCEEDED(rc)) return 0;',
+                  '    p3r_diag_end( diagnostic_slot, rc, p3r_diag_now() );\n'
+                  '    if (R_SUCCEEDED(rc)) return 0;')
+              part = replace_once(part, '    svcSignalToAddress( (void *)addr, SignalType_Signal, 0, count );',
+                  '    struct p3r_diag_snapshot observed = {0};\n'
+                  '    Result result = svcSignalToAddress( (void *)addr, SignalType_Signal, 0, count );\n'
+                  '    observed.tid = p3r_diag_tid(); observed.kind = 32;\n'
+                  '    observed.address = (uintptr_t)addr; observed.expected = (uint32_t)count;\n'
+                  '    observed.last_rc = result; observed.started_ns = p3r_diag_now();\n'
+                  '    p3r_diag_event( &observed );')
+              horizon = horizon[:start] + part + horizon[end:]
+              modified['dlls/ntdll/unix/horizon.c'] = horizon
+          
+              sync = modified['dlls/ntdll/unix/sync.c']
+              sync = replace_once(sync, '#include "horizon_threads.h"',
+                  '#include "horizon_threads.h"\n'
+                  'extern void horizon_p3r_wait_context( unsigned kind, uintptr_t object, uintptr_t key );')
+              sync = replace_once(sync, 'HANDLE keyed_event = 0;',
+                  '#ifndef __SWITCH__\n'
+                  '#define horizon_p3r_wait_context(kind, object, key) ((void)0)\n'
+                  '#endif\n\nHANDLE keyed_event = 0;')
+              sync = replace_once(sync, '                ret = futex_wait( futex, 0, &timespec );',
+                  '                horizon_p3r_wait_context( 1, 0, (uintptr_t)address );\n'
+                  '                ret = futex_wait( futex, 0, &timespec );\n'
+                  '                horizon_p3r_wait_context( 0, 0, 0 );')
+              sync = replace_once(sync, '            else\n                ret = futex_wait( futex, 0, NULL );',
+                  '            else {\n'
+                  '                horizon_p3r_wait_context( 1, 0, (uintptr_t)address );\n'
+                  '                ret = futex_wait( futex, 0, NULL );\n'
+                  '                horizon_p3r_wait_context( 0, 0, 0 );\n'
+                  '            }')
+              # Keep these calls inside the existing __SWITCH__ branch.
+              sync = replace_once(sync, '    return horizon_keyed_rendezvous( &keyed_event_lock, &keyed_event_queue, &self, timeout_ns,\n'
+                                        '                                     keyed_event_now_ns, horizon_futex_wait, horizon_futex_wake )\n'
+                                        '           ? STATUS_TIMEOUT : STATUS_SUCCESS;',
+                  '    {\n'
+                  '        int result;\n'
+                  '        horizon_p3r_wait_context( release ? 3 : 2, self.object, self.key );\n'
+                  '        result = horizon_keyed_rendezvous( &keyed_event_lock, &keyed_event_queue, &self, timeout_ns,\n'
+                  '                                           keyed_event_now_ns, horizon_futex_wait, horizon_futex_wake );\n'
+                  '        horizon_p3r_wait_context( 0, 0, 0 );\n'
+                  '        return result ? STATUS_TIMEOUT : STATUS_SUCCESS;\n'
+                  '    }')
+              modified['dlls/ntdll/unix/sync.c'] = sync
+          
+              profile = modified['horizon-wine/source/thread_profile.c']
+              profile = replace_once(profile, '        for (f = 0; f < frames; f++)',
+                  '        len = appendf( line, len, " x0=%#llx x1=%#llx x2=%#llx x3=%#llx",\n'
+                  '                       (unsigned long long)ctx.cpu_gprs[0].x, (unsigned long long)ctx.cpu_gprs[1].x,\n'
+                  '                       (unsigned long long)ctx.cpu_gprs[2].x, (unsigned long long)ctx.cpu_gprs[3].x );\n'
+                  '        for (f = 0; f < frames; f++)')
+              modified['horizon-wine/source/thread_profile.c'] = profile
+              # All source checks/anchors passed before any files are written.
+              output.mkdir(parents=True, exist_ok=True)
+              diff = ''
+              for name, text in modified.items():
+                  (root / name).write_text(text)
+                  diff += ''.join(difflib.unified_diff(originals[name].splitlines(True), text.splitlines(True),
+                                                       fromfile='a/'+name, tofile='b/'+name))
+              target = root / 'horizon-wine/source/p3r_wait_diag.h'
+              target.write_bytes(header.read_bytes())
+              diff += ''.join(difflib.unified_diff([], target.read_text().splitlines(True),
+                                                  fromfile='/dev/null', tofile='b/horizon-wine/source/p3r_wait_diag.h'))
+              (output / 'p3r-wait-diagnostic.patch').write_text(diff)
+              (output / 'p3r-wait-source-lock.json').write_text(json.dumps({
+                  'revision': '1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877', 'diagnostic': 'wait-snapshot-r1',
+                  'build_id': build_id,
+                  'original_sources': LOCKS,
+                  'header_sha256': hashlib.sha256(header.read_bytes()).hexdigest(),
+                  'patched_sources': {name: hashlib.sha256(text.encode()).hexdigest() for name,text in modified.items()},
+                  'changes_wait_results_or_timeout_arguments': False,
+                  'modifies_game_exe_or_dlls': False,
+                  'switch_runtime_verified': False,
+              }, indent=2)+'\n')
+          
+          if __name__ == '__main__':
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument('root', type=Path)
+              parser.add_argument('header', type=Path)
+              parser.add_argument('output', type=Path)
+              parser.add_argument('--build-id', default='local-test')
+              args = parser.parse_args()
+              patch(args.root, args.header, args.output, args.build_id)
+          P3R_FILE_1_END
+          cat > "$CLOUD_ROOT/p3r-source/run_checks.py" <<'P3R_FILE_2_END'
+          #!/usr/bin/env python3
+          """Host checks for the exact patched futex wrapper; not a Switch runtime test."""
+          import argparse
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          
+          def load_module(name, path):
+              spec=importlib.util.spec_from_file_location(name,path)
+              module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+              return module
+          
+          def check(root, source, output):
+              output.mkdir(parents=True,exist_ok=True)
+              patcher=load_module('patcher',source/'patch_runtime.py')
+              symbol=load_module('symbol',source/'symbolicate_profile.py')
+              horizon=(root/'dlls/ntdll/unix/horizon.c').read_text()
+              begin=horizon.index('int horizon_futex_wait(')
+              end=horizon.index('/* Monotonic time since boot',begin)
+              helper=patcher.NATIVE_HELPERS.replace(
+                  '#include "../../../horizon-wine/source/p3r_wait_diag.h"','#include "p3r_wait_diag.h"'
+              ).replace('void horizon_p3r_report_waits(void)','static void horizon_p3r_report_waits(void)')
+              wrapper=output/'futex_wrapper.c'
+              wrapper.write_text((source/'futex_test_prefix.h').read_text()+helper+horizon[begin:end]+(source/'futex_test_main.inc').read_text())
+              cc=os.environ.get('CC','cc')
+              results=[]
+              for name, file in [('wait_registry',source/'test_wait_diag.c'),('futex_wrapper',wrapper)]:
+                  binary=output/name
+                  subprocess.run([cc,'-std=c11','-O2','-Wall','-Wextra','-Werror','-pthread','-I',str(source),str(file),'-o',str(binary)],check=True)
+                  result=subprocess.check_output([str(binary)],text=True).strip()
+                  print(result);results.append(result)
+              # Exercise the actual scheduling expression extracted from the patched source.
+              runtime=(root/'horizon-wine/source/runtime.c').read_text()
+              assert 'if ((quiet >= 2 && reported < 3) || (quiet >= 6 && !(quiet % 6)))' in runtime
+              snapshots=[];reported=0
+              for quiet in range(1,49):
+                  if (quiet>=2 and reported<3) or (quiet>=6 and not quiet%6):
+                      snapshots.append(quiet*5);reported+=1
+              assert snapshots[:7]==[10,15,20,30,60,90,120] and 180 in snapshots and 240 in snapshots
+              results.append('PASS: native snapshots continue through 30/60/90/120/180/240 seconds')
+              table={'build_id':'test-1','runtime_sha256':'test','symbols':[{'address':0x100,'size':0x80,'name':'horizon_futex_wait'},{'address':0x200,'size':0x40,'name':'alert_wait'}]}
+              text='[P3R-DIAG] wait-snapshot-r1 id=test-1; native observation only\n[PROF] 4w callers: +0x120<+0x218 100.0%\n'
+              decoded=symbol.symbolicate(table,text)
+              assert [r['symbol'] for r in decoded['addresses']]==['horizon_futex_wait+0x20','alert_wait+0x18']
+              late=text+'[PROF] sampler started: runtime 0x1000000-0x1001000\n[STALL] thread 4w at 0x1000120 sp=0x2000 lr=0x1000218 < 0x1000120\n'
+              assert [r['symbol'] for r in symbol.symbolicate(table,late)['addresses']][-2:]==['horizon_futex_wait+0x20','alert_wait+0x18']
+              try:symbol.symbolicate(table,text.replace('test-1','other-build'))
+              except ValueError:pass
+              else:raise AssertionError('Wrong build accepted')
+              results.append('PASS: symbols resolve native offsets; mismatched build is rejected')
+              # A second application must fail before modifying any source.
+              before={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in patcher.LOCKS}
+              try:patcher.patch(root,source/'p3r_wait_diag.h',output/'must-not-write')
+              except ValueError:pass
+              else:raise AssertionError('Second patch unexpectedly accepted')
+              assert before=={name:hashlib.sha256((root/name).read_bytes()).hexdigest() for name in patcher.LOCKS}
+              results.append('PASS: duplicate or changed upstream sources are rejected without writes')
+              report={'host_checks':'PASS','checks':results,'snapshot_seconds':snapshots,'switch_runtime_verified':False,'p3r_boot_verified':False}
+              (output/'HOST-CHECKS.json').write_text(json.dumps(report,indent=2)+'\n')
+              print('PASS: all host checks; Switch compilation and execution remain unverified')
+          
+          if __name__=='__main__':
+              p=argparse.ArgumentParser(description=__doc__);p.add_argument('root',type=Path);p.add_argument('source',type=Path);p.add_argument('output',type=Path)
+              args=p.parse_args();check(args.root,args.source,args.output)
+          P3R_FILE_2_END
+          cat > "$CLOUD_ROOT/p3r-source/test_wait_diag.c" <<'P3R_FILE_3_END'
+          #include <assert.h>
+          #include <pthread.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include "p3r_wait_diag.h"
+          
+          static uint64_t done;
+          static void *writer(void *arg)
+          {
+              uint64_t id = (uintptr_t)arg, i;
+              for (i=0; i<20000; ++i) {
+                  struct p3r_diag_snapshot s = {0};
+                  int slot;
+                  s.tid=id; s.kind=1; s.address=id*32; s.expected=id*47; s.key=id*71;
+                  slot=p3r_diag_begin(&s);
+                  assert(slot>=0);
+                  p3r_diag_round(slot, 0xdead);
+                  s.kind=32; p3r_diag_event(&s);
+                  p3r_diag_end(slot, 0, i);
+              }
+              __atomic_add_fetch(&done, 1, __ATOMIC_RELEASE);
+              return NULL;
+          }
+          
+          int main(void)
+          {
+              pthread_t writers[8];
+              struct p3r_diag_snapshot s={0}, read;
+              unsigned i, active=0, events=0;
+              int slots[P3R_DIAG_SLOTS];
+              s.tid=9; s.address=0x1234; s.timeout_ns=(uint64_t)-1; s.kind=2;
+              for (i=0; i<P3R_DIAG_SLOTS; ++i) { slots[i]=p3r_diag_begin(&s); assert(slots[i]>=0); }
+              assert(p3r_diag_begin(&s)==-1);
+              for (i=0; i<P3R_DIAG_SLOTS; ++i) {
+                  assert(p3r_diag_read(p3r_diag_waits+slots[i], &read));
+                  assert(read.tid==9 && read.address==0x1234 && read.timeout_ns==(uint64_t)-1);
+                  p3r_diag_end(slots[i], 0, 1);
+                  assert(!p3r_diag_read(p3r_diag_waits+slots[i], &read));
+              }
+              for (i=0; i<8; ++i) assert(!pthread_create(writers+i, NULL, writer, (void *)(uintptr_t)(i+1)));
+              while (P3R_DIAG_LOAD(&done)!=8) {
+                  for (i=0; i<P3R_DIAG_SLOTS; ++i) {
+                      if (p3r_diag_read(p3r_diag_waits+i,&read)) {
+                          assert(read.kind==1 && read.address==read.tid*32 && read.expected==read.tid*47 && read.key==read.tid*71);
+                          active++;
+                      }
+                      if (p3r_diag_read(p3r_diag_events+i,&read) && read.tid!=9) {
+                          assert((read.kind==17 || read.kind==32) && read.address==read.tid*32 && read.key==read.tid*71);
+                          events++;
+                      }
+                  }
+              }
+              for (i=0; i<8; ++i) assert(!pthread_join(writers[i],NULL));
+              for (i=0; i<P3R_DIAG_SLOTS; ++i) assert(!p3r_diag_read(p3r_diag_waits+i,&read));
+              assert(active && events);
+              printf("PASS: 160000 concurrent wait lifecycles, %u active and %u history snapshots; bounded overflow\n",active,events);
+              return 0;
+          }
+          P3R_FILE_3_END
+          cat > "$CLOUD_ROOT/p3r-source/futex_test_prefix.h" <<'P3R_FILE_4_END'
+          
+          #include <assert.h>
+          #include <errno.h>
+          #include <stdio.h>
+          #include <stdint.h>
+          #include <string.h>
+          typedef unsigned Result;typedef uint32_t u32;typedef uint64_t u64;
+          typedef struct { uint64_t addr,size;unsigned perm; } MemoryInfo;
+          #define Perm_R 1
+          #define R_SUCCEEDED(rc) (!(rc))
+          #define R_FAILED(rc) ((rc)!=0)
+          #define R_MODULE(rc) ((rc)&511)
+          #define R_DESCRIPTION(rc) ((rc)>>9)
+          #define Module_Kernel 1
+          #define KernelError_TimedOut 7
+          #define KernelError_InvalidState 8
+          #define ArbitrationType_WaitIfEqual 2
+          #define SignalType_Signal 0
+          struct thread_data { unsigned tid; };static struct thread_data data={4};
+          static struct thread_data *get_thread_data(void){return &data;}
+          static uint64_t now_ns;static uint64_t armGetSystemTick(void){return now_ns;}
+          static uint64_t armTicksToNs(uint64_t n){return n;}
+          static Result svcQueryMemory(MemoryInfo *i,u32 *p,u64 a){(void)i;(void)p;(void)a;return 1;}
+          static unsigned log_lines;static void wine_nx_runtime_trace(const char *s){assert(s);log_lines++;}
+          volatile int wine_nx_quit_requested;
+          void wine_nx_quit_point(void) __attribute__((weak));
+          void wine_nx_quit_point(void) {wine_nx_quit_requested=0;}
+          static Result answers[8];static int called;static long long received[8];
+          static void horizon_p3r_report_waits(void);
+          static Result svcWaitForAddress(void *a,unsigned arb,long long v,long long t){
+           assert(a && arb==2 && v==0);received[called]=t;now_ns+=2000000000ULL;
+           horizon_p3r_report_waits();return answers[called++];}
+          static Result svcSignalToAddress(void *a,unsigned t,long long v,int count){
+           assert(a && t==0 && v==0 && count==3);return 77;}
+          
+          P3R_FILE_4_END
+          cat > "$CLOUD_ROOT/p3r-source/futex_test_main.inc" <<'P3R_FILE_5_END'
+          int main(void){
+           int word=0;struct p3r_diag_snapshot s;unsigned i,seen=0;
+           horizon_p3r_wait_context(1,0,0);errno=EBUSY;
+           answers[0]=(7<<9)|1;answers[1]=(7<<9)|1;answers[2]=0;
+           assert(horizon_futex_wait(&word,0,-1)==0 && called==3 && errno==EBUSY);
+           for(i=0;i<3;i++)assert(received[i]==250000000LL);
+           assert(log_lines>=3);
+           called=0;answers[0]=(7<<9)|1;
+           assert(horizon_futex_wait(&word,0,1234)==-1 && called==1 && received[0]==1234 && errno==ETIMEDOUT);
+           called=0;answers[0]=(8<<9)|1;
+           assert(horizon_futex_wait(&word,0,-1)==-1 && called==1 && errno==EAGAIN);
+           called=0;answers[0]=2;
+           assert(horizon_futex_wait(&word,0,-1)==-1 && called==1 && errno==EINVAL);
+           horizon_futex_wake(&word,3);
+           for(i=0;i<P3R_DIAG_SLOTS;i++)if(p3r_diag_read(p3r_diag_events+i,&s)&&s.kind==32){
+            assert(s.last_rc==77 && s.expected==3 && s.address==(uintptr_t)&word);seen++;}
+           assert(seen==1);
+           puts("PASS: unchanged infinite slices, finite timeout, success, EAGAIN, ETIMEDOUT, EINVAL; active capture and wake kernel result");return 0;}
+          P3R_FILE_5_END
+          cat > "$CLOUD_ROOT/p3r-source/symbolicate_profile.py" <<'P3R_FILE_6_END'
+          #!/usr/bin/env python3
+          """Resolve only native runtime offsets, against the matching diagnostic build."""
+          import argparse
+          import bisect
+          import json
+          import re
+          from pathlib import Path
+          
+          def resolve(symbols, address):
+              starts = [row['address'] for row in symbols]
+              i = bisect.bisect_right(starts, address)-1
+              while i >= 0 and address - symbols[i]['address'] < 1048576:
+                  row = symbols[i]
+                  limit = row['address']+row['size'] if row['size'] else (starts[i+1] if i+1<len(starts) else row['address'])
+                  if row['address'] <= address < limit:
+                      return row['name'] + '+0x%x' % (address-row['address'])
+                  i -= 1
+              return 'unresolved'
+          
+          def symbolicate(table, text):
+              build_id = table['build_id']
+              if f'[P3R-DIAG] wait-snapshot-r1 id={build_id};' not in text:
+                  raise ValueError('Profile does not identify this diagnostic build; refusing to guess symbols')
+              bounds=re.search(r'\[PROF\].*?runtime (0x[0-9a-fA-F]+)-(0x[0-9a-fA-F]+)',text)
+              native_base,native_end=(int(v,16) for v in bounds.groups()) if bounds else (0,0)
+              results=[]
+              for n,line in enumerate(text.splitlines(),1):
+                  if '[PROF]' not in line and '[P3R-WAIT]' not in line and '[STALL]' not in line:
+                      continue
+                  if re.search(r'\b(?:pe|x86|x86 callers|x86 frames):',line):
+                      continue
+                  values=set(int(v,16) for v in re.findall(r'\+(0x[0-9a-fA-F]+)',line))
+                  values.update(int(v,16) for v in re.findall(r'caller_offset=(0x[0-9a-fA-F]+)',line))
+                  if '[STALL]' in line:
+                      values=set()
+                      for value in re.findall(r'(?:at |lr=|< )(0x[0-9a-fA-F]+)',line):
+                          address=int(value,16)
+                          if native_base <= address < native_end:
+                              values.add(address-native_base)
+                  for address in sorted(values):
+                      results.append({'line':n,'offset':hex(address),'symbol':resolve(table['symbols'],address)})
+              return {'build_id':build_id,'native_runtime_sha256':table['runtime_sha256'],'addresses':results}
+          
+          if __name__=='__main__':
+              p=argparse.ArgumentParser(description=__doc__)
+              p.add_argument('symbols',type=Path);p.add_argument('profile',type=Path)
+              p.add_argument('--output',type=Path)
+              args=p.parse_args()
+              report=symbolicate(json.loads(args.symbols.read_text()),args.profile.read_text(errors='replace'))
+              text=json.dumps(report,indent=2,ensure_ascii=False)+'\n'
+              if args.output:args.output.write_text(text)
+              else:print(text,end='')
+          P3R_FILE_6_END
+          cat > "$CLOUD_ROOT/p3r-source/collect_runtime.py" <<'P3R_FILE_7_END'
+          #!/usr/bin/env python3
+          """Validate the complete build, then export only its NRO update and symbols."""
+          import argparse
+          import hashlib
+          import importlib.util
+          import json
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          from zipfile import ZipFile, ZIP_DEFLATED
+          
+          def collect(root, cloud, llvm):
+              spec=importlib.util.spec_from_file_location('cloud_helper',cloud/'cloud_helper.py')
+              helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(helper)
+              archives=list((root/'horizon-wine/build-autorun').glob('autorun-*.zip'))
+              if len(archives)!=1:raise ValueError('Expected one completely packaged upstream runtime')
+              checked=helper.validate_runtime(archives[0])
+              lock=json.loads((cloud/'diagnostics/p3r-wait-source-lock.json').read_text())
+              build_id=lock['build_id']
+              with ZipFile(archives[0]) as z:
+                  nro=z.read('switch/wine/wine-nx-runtime.nro')
+              marker=f'[P3R-DIAG] wait-snapshot-r1 id={build_id}; native observation only'.encode()
+              if marker not in nro or b'[P3R-WAIT]' not in nro:
+                  raise ValueError('Diagnostic marker absent from the compiled NRO')
+              digest=hashlib.sha256(nro).hexdigest()
+              elf=root/'horizon-wine/build-switch-amd64/wine-nx-runtime.elf'
+              if not elf.is_file():raise ValueError('Matching native ELF is missing')
+              nm=subprocess.check_output([str(llvm/'bin/llvm-nm'),'--numeric-sort','--print-size','--defined-only',str(elf)],text=True)
+              symbols=[]
+              for line in nm.splitlines():
+                  m=re.fullmatch(r'([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+([tTwW])\s+(.+)',line)
+                  if m:symbols.append({'address':int(m[1],16),'size':int(m[2],16),'name':m[4]})
+              required={'horizon_futex_wait','horizon_p3r_report_waits','NtWaitForAlertByThreadId'}
+              if not required.issubset({s['name'] for s in symbols}):
+                  raise ValueError('Native ELF is stripped or incomplete; required wait symbols missing')
+              out=cloud/'dist';out.mkdir(exist_ok=True)
+              symbols_dir=cloud/'symbols';symbols_dir.mkdir(exist_ok=True)
+              filename=f'Autorun_P3R_Runtime_Diagnostic_{build_id}.zip'
+              with ZipFile(out/filename,'w',ZIP_DEFLATED,compresslevel=6) as z:
+                  z.writestr('switch/wine/wine-nx-runtime.nro',nro)
+              with ZipFile(out/filename) as z:
+                  if z.testzip() or z.namelist()!=['switch/wine/wine-nx-runtime.nro']:
+                      raise ValueError('Unexpected runtime update contents')
+                  if hashlib.sha256(z.read(z.namelist()[0])).hexdigest()!=digest:raise ValueError('NRO readback mismatch')
+              shutil.copy2(elf,symbols_dir/elf.name)
+              (symbols_dir/'runtime-symbols.txt').write_text(nm)
+              (symbols_dir/'runtime-symbols.json').write_text(json.dumps({'build_id':build_id,'runtime_sha256':digest,'symbols':symbols},indent=2)+'\n')
+              for name in ['symbolicate_profile.py','patch_runtime.py','p3r_wait_diag.h']:
+                  shutil.copy2(cloud/'p3r-source'/name,symbols_dir/name)
+              for name in ['p3r-wait-source-lock.json','p3r-wait-diagnostic.patch','source-lock.json','cloud-portability.patch']:
+                  shutil.copy2(cloud/'diagnostics'/name,symbols_dir/name)
+              instructions=f'''Диагностический Autorun для уже настроенной среды nx-amd64-fex-2640.
+          Сборка {build_id}; это сбор наблюдений, исправление зависания пока не заявлено.
+          
+          1. Полностью закрыть Autorun. Сохранить прежний SD:/switch/wine/wine-nx-runtime.nro
+             на компьютере для отката.
+          2. Распаковать {filename} в корень SD с заменой ОДНОГО файла:
+             switch/wine/wine-nx-runtime.nro.
+          3. Запустить консоль через уже настроенную запись Hekate -> Autorun.
+             Повторный Quick setup не требуется. Загрузочные компоненты в этом ZIP отсутствуют.
+          4. У Persona: FEX_SMCCHECKS=Full, Profiler=On, Verbose traces=Off.
+             Остальные параметры сохранить. Запустить P3R на две минуты.
+          5. Полностью закрыть Autorun. Передать P3R_profiler.log из switch/wine/logs/.
+             В начале должен быть маркер [P3R-DIAG] wait-snapshot-r1 id={build_id};.
+          6. Для расшифровки адресов нужен парный artifact autorun-p3r-symbols того же
+             запуска GitHub Actions. Его сохранить на компьютере; на SD он не нужен.
+          
+          Эта замена не требует копирования игры, EXE, DLL или повторной настройки памяти.
+          Она записывает текущее ожидание, тип, ключ, последние вызовы пробуждения и
+          поздние снимки потоков. История ограничена: отсутствие wake в ней само по себе
+          не доказывает, что сигнал никогда не посылался. Слово объекта читается как
+          диагностический снимок и может меняться; оно не является доказанным ID владельца.
+          
+          Откат: вернуть сохраненный wine-nx-runtime.nro. На реальном Switch этот новый
+          NRO еще не проверен. Сборка и проверки на ПК не доказывают запуск P3R.
+          '''
+              (out/'INSTALL_RU.txt').write_text(instructions)
+              report={'diagnostic':'wait-snapshot-r1','build_id':build_id,'native_runtime_sha256':digest,
+                      'native_runtime_bytes':len(nro),'native_symbols':len(symbols),'update_archive':filename,
+                      'cloud_compilation_finished':True,'complete_upstream_package_validation':checked,
+                      'switch_runtime_verified':False,'p3r_boot_verified':False,'deadlock_fix_claimed':False,
+                      'installation_changes_only':['switch/wine/wine-nx-runtime.nro']}
+              (out/'BUILD-REPORT.json').write_text(json.dumps(report,indent=2)+'\n')
+              for folder in [out,symbols_dir]:
+                  (folder/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in sorted(folder.iterdir()) if p.is_file() and p.name!='SHA256SUMS.txt'))
+              print(json.dumps(report,indent=2))
+          
+          if __name__=='__main__':
+              p=argparse.ArgumentParser(description=__doc__);p.add_argument('root',type=Path);p.add_argument('cloud',type=Path);p.add_argument('llvm',type=Path)
+              args=p.parse_args();collect(args.root,args.cloud,args.llvm)
+          P3R_FILE_7_END
+          python3 "$CLOUD_ROOT/p3r-source/patch_runtime.py" "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/p3r-source/p3r_wait_diag.h" "$CLOUD_ROOT/diagnostics" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python3 "$CLOUD_ROOT/p3r-source/run_checks.py" "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/p3r-source" "$CLOUD_ROOT/diagnostics/host-checks"
+
       - name: Ensure Linux LLVM tools before compilation
         run: |
           set -euo pipefail
@@ -379,12 +1070,10 @@ jobs:
             autorun/horizon-wine/toolchains/boot-payloads/bundle
           key: autorun-tools-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.AUTORUN_REVISION }}-2f1c7e14e601
 
-      - name: Validate and collect SD archives
+      - name: Validate NRO-only update and matching native symbols
         run: |
           set -euo pipefail
-          extra=()
-          if [[ "$INCLUDE_DLLS" = true ]]; then extra+=(--include-dlls); fi
-          python3 "$CLOUD_ROOT/cloud_helper.py" collect "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/dist" "${extra[@]}" 2>&1 | tee "$CLOUD_ROOT/diagnostics/package-check.log"
+          python3 "$CLOUD_ROOT/p3r-source/collect_runtime.py" "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT" "$WINE_NX_LLVM_MINGW" 2>&1 | tee "$CLOUD_ROOT/diagnostics/package-check.log"
           cat "$CLOUD_ROOT/dist/BUILD-REPORT.json" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preserve build diagnostics
@@ -401,13 +1090,13 @@ jobs:
             fi
           done
 
-      - name: Downloadable SD package
+      - name: Downloadable NRO-only runtime update
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: autorun-x64-sd-${{ github.run_id }}
+          name: autorun-p3r-runtime-${{ github.run_id }}
           path: cloud-work/dist/
-          retention-days: 7
+          retention-days: 30
           compression-level: 0
           if-no-files-found: error
 
@@ -415,24 +1104,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: autorun-x64-logs-${{ github.run_id }}
+          name: autorun-p3r-logs-${{ github.run_id }}
           path: cloud-work/diagnostics/
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: warn
 
-      - name: Explain intermediate runtime archive
-        if: always() && hashFiles('autorun/horizon-wine/build-switch-amd64/wine-nx-amd64-*.zip') != ''
-        run: |
-          printf '%s\n' 'Intermediate compiled runtime for diagnosis/recovery. This is not the complete validated SD launcher package. Use autorun-x64-sd when available.' > "$CLOUD_ROOT/INTERMEDIATE_README.txt"
-
-      - name: Preserve compiled runtime if final packaging fails
-        if: always() && hashFiles('autorun/horizon-wine/build-switch-amd64/wine-nx-amd64-*.zip') != ''
+      - name: Downloadable native symbols for this exact NRO
+        if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: autorun-x64-intermediate-${{ github.run_id }}
-          path: |
-            autorun/horizon-wine/build-switch-amd64/wine-nx-amd64-*.zip
-            cloud-work/INTERMEDIATE_README.txt
-          retention-days: 7
-          compression-level: 0
-          if-no-files-found: warn
+          name: autorun-p3r-symbols-${{ github.run_id }}
+          path: cloud-work/symbols/
+          retention-days: 30
+          compression-level: 6
+          if-no-files-found: error
