@@ -1,5 +1,5 @@
-# Diagnostic kit r1.1: GCC fixture linkage and concurrent snapshot consistency fixes
-name: Build Autorun P3R wait diagnostic r1.1
+# Unified debugger: bounded process snapshots, matching PE/native symbols and USB station
+name: Build Autorun P3R unified debugger
 
 on:
   workflow_dispatch:
@@ -330,11 +330,11 @@ jobs:
           python3 "$CLOUD_ROOT/cloud_helper.py" patch "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/diagnostics"
           git -C "$GITHUB_WORKSPACE/autorun" submodule status > "$CLOUD_ROOT/diagnostics/submodules.txt"
 
-      - name: Install and apply pinned native wait instrumentation
+      - name: Install unified snapshot instrumentation and run host checks
         run: |
           set -euo pipefail
           mkdir -p "$CLOUD_ROOT/p3r-source"
-          cat > "$CLOUD_ROOT/p3r-source/p3r_wait_diag.h" <<'P3R_FILE_0_END'
+          cat > "$CLOUD_ROOT/p3r-source/p3r_wait_diag.h" <<'P3R_UNIFIED_FILE_0_END'
           /* Process-local, bounded wait observations. No allocation, OS locks or wakeups. */
           #ifndef P3R_WAIT_DIAG_H
           #define P3R_WAIT_DIAG_H
@@ -446,8 +446,343 @@ jobs:
               }
           }
           #endif
-          P3R_FILE_0_END
-          cat > "$CLOUD_ROOT/p3r-source/patch_runtime.py" <<'P3R_FILE_1_END'
+          P3R_UNIFIED_FILE_0_END
+          cat > "$CLOUD_ROOT/p3r-source/p3r_pe_wait.h" <<'P3R_UNIFIED_FILE_1_END'
+          /* Read-only decoder for the pinned ARM64EC ntdll's RtlWaitOnAddress queue.
+           * Layout is verified against 9b60d0f0e9da75e05fa390fd4445982ad8cf5be452638e2e0b1c5aa412561444.
+           * No OS/Wine calls, lock acquisition, writes, forced wakes or timeout changes.
+           * A snapshot is advisory; mismatched DLLs and inconsistent lists are rejected. */
+          #ifndef P3R_PE_WAIT_H
+          #define P3R_PE_WAIT_H
+          #include <stdint.h>
+          #include <string.h>
+          
+          typedef int (*p3r_pe_read_fn)(void *, uint64_t, void *, unsigned);
+          struct p3r_pe_wait {
+              uint64_t entry, address, value, wait_sp, caller, caller_sp, upper_return;
+              uint64_t lock, lock_value, saved[4];
+              unsigned queue_index, kind, value_valid, lock_valid;
+          };
+          /* kind: 0 direct/unknown, 1 SRW exclusive, 2 SRW shared, 3 CV+CS,
+           * 4 CV+SRW sleeping, 5/6 CV+SRW reacquiring exclusive/shared. */
+          
+          static int p3r_pe_read64(p3r_pe_read_fn read, void *ctx, uint64_t at, uint64_t *out)
+          {
+              return at <= UINT64_MAX - 8 && read(ctx, at, out, 8);
+          }
+          
+          static int p3r_pe_fingerprint(uint64_t base, p3r_pe_read_fn read, void *ctx)
+          {
+              /* All fields are little endian on the host tests and target ARM64. */
+              static const uint32_t offsets[] = {0xd0d88,0xd0d98,0xd0e54,0xd0e58,0xd0e5c,
+                                                0xd0e68,0xd0f78,0xd0f7c,0xd0d2c,0xd1094,
+                                                0xd152c,0xd1554,0xd1564,0xd16d8,0xd1764,0xd17ac};
+              static const uint32_t words[] = {0xd10203ff,0xf9003bfe,0xd00004ab,0x9139816b,0xf9001bf5,
+                                              0xb9003bea,0x94007476,0xf9401be8,0x94000017,0x97ffff3d,
+                                              0x97fffe17,0xd10183ff,0xa9057bfb,0x97fffdac,0x97fffd89,0x97fffd77};
+              uint32_t value, pe;
+              uint16_t mz;
+              unsigned i;
+              if (base > UINT64_MAX - 0x1c0000 || !read(ctx,base,&mz,2) || mz != 0x5a4d ||
+                  !read(ctx,base+0x3c,&pe,4) || pe > 0x1000 ||
+                  !read(ctx,base+pe,&value,4) || value != 0x4550 ||
+                  !read(ctx,base+pe+8,&value,4) || value != 0x6abec4b3 ||
+                  !read(ctx,base+pe+24+56,&value,4) || value != 0x1c0000) return 0;
+              for (i=0;i<sizeof(offsets)/sizeof(offsets[0]);i++)
+                  if (!read(ctx,base+offsets[i],&value,4) || value != words[i]) return 0;
+              return 1;
+          }
+          
+          /* Return 1 matched, 0 absent/inconsistent, -1 unsupported DLL. Only the
+           * native ARM64EC queue reached in the physical trace is decoded. */
+          static int p3r_pe_find_wait(uint64_t base, unsigned tid, p3r_pe_read_fn read,
+                                      void *ctx, struct p3r_pe_wait *out)
+          {
+              unsigned q, step;
+              uint64_t heads=base+0x166e60;
+              if (!p3r_pe_fingerprint(base,read,ctx)) return -1;
+              for (q=0;q<256;q++) {
+                  uint64_t head=heads+q*24, node, previous=head;
+                  if (!p3r_pe_read64(read,ctx,head,&node)) return 0;
+                  for (step=0;node && node!=head && step<16;step++) {
+                      struct { uint64_t next, prev, address; uint32_t tid,padding; } entry, again;
+                      uint64_t caller;
+                      struct p3r_pe_wait s={0};
+                      if (node < 0x20 || node > UINT64_MAX-0xc0 || (node & 15) ||
+                          !read(ctx,node,&entry,sizeof(entry)) || entry.prev != previous || entry.next == node) break;
+                      if (entry.tid != tid || !entry.address || ((entry.address>>4)&255) != q) {
+                          previous=node;node=entry.next;continue;
+                      }
+                      s.entry=node;s.address=entry.address;s.wait_sp=node-0x20;s.caller_sp=s.wait_sp+0x80;s.queue_index=q;
+                      if (!p3r_pe_read64(read,ctx,s.wait_sp+0x70,&caller) || !caller ||
+                          !read(ctx,s.wait_sp+0x40,s.saved,sizeof(s.saved))) return 0;
+                      s.caller=caller;
+                      s.value_valid=p3r_pe_read64(read,ctx,s.address,&s.value);
+                      switch (caller-base) {
+                      case 0xd0d30: s.kind=1;s.lock=s.address>=2?s.address-2:0;
+                          p3r_pe_read64(read,ctx,s.caller_sp+0x28,&s.upper_return);break;
+                      case 0xd1098: s.kind=2;s.lock=s.address;
+                          p3r_pe_read64(read,ctx,s.caller_sp+0x18,&s.upper_return);break;
+                      case 0xd1530: s.kind=3;
+                          p3r_pe_read64(read,ctx,s.caller_sp+0x28,&s.upper_return);break;
+                      case 0xd16dc: s.kind=4;
+                          p3r_pe_read64(read,ctx,s.caller_sp+0x58,&s.upper_return);break;
+                      case 0xd1768: s.kind=5;s.lock=s.address>=2?s.address-2:0;
+                          p3r_pe_read64(read,ctx,s.caller_sp+0x58,&s.upper_return);break;
+                      case 0xd17b0: s.kind=6;s.lock=s.address;
+                          p3r_pe_read64(read,ctx,s.caller_sp+0x58,&s.upper_return);break;
+                      default: break;
+                      }
+                      s.lock_valid=s.lock && p3r_pe_read64(read,ctx,s.lock,&s.lock_value);
+                      /* Detect removal/reuse while observing. No queue spinlock is taken. */
+                      if (!read(ctx,node,&again,sizeof(again)) || memcmp(&entry,&again,sizeof(entry))) return 0;
+                      *out=s;return 1;
+                  }
+              }
+              return 0;
+          }
+          #endif
+          P3R_UNIFIED_FILE_1_END
+          cat > "$CLOUD_ROOT/p3r-source/p3r_dump.h" <<'P3R_UNIFIED_FILE_2_END'
+          /* Bounded, allocation-free process snapshot container. Little-endian ARM64.
+           * Memory callbacks must run only while the captured program threads are paused.
+           * No file IO, mutexes, Wine calls or heap allocation are performed here. */
+          #ifndef P3R_DUMP_H
+          #define P3R_DUMP_H
+          #include <stdint.h>
+          #include <stddef.h>
+          #include <string.h>
+          #define P3R_DUMP_LIMIT (16u*1024u*1024u)
+          #define P3R_DUMP_REGION_LIMIT (256u*1024u)
+          enum { P3R_DUMP_CONTEXT=1,P3R_DUMP_MEMORY=2,P3R_DUMP_MAP=3,P3R_DUMP_ERROR=4,
+                 P3R_DUMP_BUILD=5,P3R_DUMP_MODULE=6,P3R_DUMP_WAIT=7 };
+          struct p3r_dump_header { char magic[8];uint32_t version,records;uint64_t tick,flags,bytes; };
+          struct p3r_dump_record { uint32_t type,tag;uint64_t address,size; };
+          struct p3r_dump { unsigned char *data;uint64_t capacity,used;uint32_t records,truncated; };
+          typedef int (*p3r_dump_query)(uint64_t at,uint64_t *base,uint64_t *size,unsigned *perm,unsigned *type);
+          static void p3r_dump_begin(struct p3r_dump *d,void *buffer,uint64_t capacity,uint64_t tick)
+          {
+           struct p3r_dump_header h={{'P','3','R','D','M','P','1',0},1,0,tick,0,0};
+           d->data=buffer;d->capacity=capacity;d->used=0;d->records=d->truncated=0;
+           if(capacity<sizeof(h)){d->truncated=1;return;}
+           memcpy(buffer,&h,sizeof(h));d->used=sizeof(h);
+          }
+          static int p3r_dump_add(struct p3r_dump *d,unsigned type,unsigned tag,uint64_t address,const void *p,uint64_t size)
+          {
+           struct p3r_dump_record r={type,tag,address,size};
+           if(d->used>d->capacity || sizeof(r)>d->capacity-d->used || size>d->capacity-d->used-sizeof(r)) {d->truncated=1;return 0;}
+           memcpy(d->data+d->used,&r,sizeof(r));d->used+=sizeof(r);
+           if(size)memcpy(d->data+d->used,p,(size_t)size);
+           d->used+=size;d->records++;return 1;
+          }
+          static int p3r_dump_read(p3r_dump_query query,uint64_t at,void *dst,unsigned size)
+          {
+           uint64_t base,n;unsigned perm,type;
+           if(!size || at>UINT64_MAX-size || !query(at,&base,&n,&perm,&type) || !(perm&1) || at<base || n<size || at-base>n-size)return 0;
+           memcpy(dst,(const void *)(uintptr_t)at,size);return 1;
+          }
+          /* Read accessible subregions; inaccessible holes are recorded explicitly.
+           * A per-request cap prevents corrupt pointers/lengths from exhausting the dump. */
+          static void p3r_dump_memory(struct p3r_dump *d,p3r_dump_query query,uint64_t at,uint64_t size,unsigned tag)
+          {
+           uint64_t end;unsigned steps=0;
+           if(!size || at>UINT64_MAX-size)return;
+           if(size>P3R_DUMP_REGION_LIMIT){size=P3R_DUMP_REGION_LIMIT;d->truncated=1;}
+           end=at+size;
+           while(at<end && steps++<256) {
+            uint64_t base,n,next,take;unsigned perm,type;
+            if(!query(at,&base,&n,&perm,&type) || !n || base>at || n>UINT64_MAX-base || (next=base+n)<=at)break;
+            take=(next<end?next:end)-at;
+            if(perm&1) {if(!p3r_dump_add(d,P3R_DUMP_MEMORY,tag,at,(const void *)(uintptr_t)at,take))return;}
+            else {uint64_t hole[2]={take,perm};if(!p3r_dump_add(d,P3R_DUMP_ERROR,tag,at,hole,sizeof(hole)))return;}
+            at+=take;
+           }
+           if(at<end)d->truncated=1;
+          }
+          static void p3r_dump_end(struct p3r_dump *d)
+          {
+           struct p3r_dump_header h;
+           if(d->used<sizeof(h))return;
+           memcpy(&h,d->data,sizeof(h));h.records=d->records;h.flags=d->truncated;h.bytes=d->used;memcpy(d->data,&h,sizeof(h));
+          }
+          #endif
+          P3R_UNIFIED_FILE_2_END
+          cat > "$CLOUD_ROOT/p3r-source/p3r_autopsy.inc" <<'P3R_UNIFIED_FILE_3_END'
+          /* Included into the pinned thread_profile.c; registry and profile_mutex are
+           * the existing sampler's. Copy while paused; resume before formatting/IO. */
+          #include "p3r_dump.h"
+          #include "p3r_layout.h"
+          _Static_assert(offsetof(ThreadContext,fp)==29*8,"ThreadContext FP layout");
+          _Static_assert(offsetof(ThreadContext,pc)==32*8,"ThreadContext PC layout");
+          static unsigned char p3r_dump_buffer[P3R_DUMP_LIMIT];
+          static ThreadContext p3r_saved_context[NX_PROF_MAX_THREADS];
+          static unsigned char p3r_saved_valid[NX_PROF_MAX_THREADS];
+          static int p3r_capture_query(uint64_t at,uint64_t *base,uint64_t *size,unsigned *perm,unsigned *type)
+          {
+           MemoryInfo m;u32 page;
+           if(R_FAILED(svcQueryMemory(&m,&page,at)))return 0;
+           *base=m.addr;*size=m.size;*perm=m.perm;*type=m.type;return 1;
+          }
+          static void p3r_capture_modules(struct p3r_dump *d,uint64_t teb)
+          {
+           uint64_t peb,ldr,head,node;unsigned index;
+           if(!p3r_dump_read(p3r_capture_query,teb+0x60,&peb,8) ||
+              !p3r_dump_read(p3r_capture_query,peb+0x18,&ldr,8))return;
+           p3r_dump_memory(d,p3r_capture_query,peb,4096,30);
+           head=ldr+0x10;
+           if(!p3r_dump_read(p3r_capture_query,head,&node,8))return;
+           for(index=0;node && node!=head && index<256;index++) {
+            unsigned char entry[0x68];uint64_t base,next,nameptr;uint32_t size;uint16_t length;
+            uint16_t name[64]={0};unsigned i;int fex=1,ntdll=1;
+            static const char fexname[]="libarm64ecfex.dll",ntname[]="ntdll.dll";
+            if(!p3r_dump_read(p3r_capture_query,node,entry,sizeof(entry)))break;
+            memcpy(&next,entry,8);memcpy(&base,entry+0x30,8);memcpy(&size,entry+0x40,4);
+            memcpy(&length,entry+0x58,2);memcpy(&nameptr,entry+0x60,8);
+            if(length>126)length=126;
+            if(length && !p3r_dump_read(p3r_capture_query,nameptr,name,length))length=0;
+            {struct {uint64_t base,size;uint16_t name[64];} module={base,size,{0}};
+             memcpy(module.name,name,sizeof(name));p3r_dump_add(d,P3R_DUMP_MODULE,0,node,&module,sizeof(module));}
+            for(i=0;i<sizeof(fexname);i++){unsigned c=name[i];if(c>='A'&&c<='Z')c+=32;if(c!=(unsigned char)fexname[i])fex=0;}
+            for(i=0;i<sizeof(ntname);i++){unsigned c=name[i];if(c>='A'&&c<='Z')c+=32;if(c!=(unsigned char)ntname[i])ntdll=0;}
+            if(base && size>=4096 && size<=0x20000000) {
+             unsigned char hdr[4096];uint32_t pe;uint16_t count,optional;
+             p3r_dump_memory(d,p3r_capture_query,base,4096,31);
+             if(ntdll)p3r_dump_memory(d,p3r_capture_query,base+0xd0000,8192,35);
+             if((fex||ntdll) && p3r_dump_read(p3r_capture_query,base,hdr,sizeof(hdr))) {
+              memcpy(&pe,hdr+60,4);
+              if(fex && pe<1024) {
+               uint32_t stamp,imagesize;uint64_t ctx;
+               memcpy(&stamp,hdr+pe+8,4);memcpy(&imagesize,hdr+pe+24+56,4);
+               if(stamp==P3R_FEX_TIMESTAMP && imagesize==P3R_FEX_IMAGE_SIZE &&
+                  p3r_dump_read(p3r_capture_query,base+P3R_FEX_CTX_RVA,&ctx,8) && ctx)
+                p3r_dump_memory(d,p3r_capture_query,ctx,65536,34);
+              }
+              if(pe<1024 && !memcmp(hdr+pe,"PE\0\0",4)) {
+               memcpy(&count,hdr+pe+6,2);memcpy(&optional,hdr+pe+20,2);
+               for(i=0;i<count && i<32;i++) {
+                unsigned off=pe+24+optional+i*40;uint32_t rva,bytes;
+                if(off>sizeof(hdr)-40)break;
+                memcpy(&bytes,hdr+off+8,4);memcpy(&rva,hdr+off+12,4);
+                if(rva>size || bytes>size-rva)continue;
+                if(fex && !memcmp(hdr+off,".text",5)) {
+                 uint32_t part;
+                 for(part=0;part<bytes;part+=P3R_DUMP_REGION_LIMIT) {
+                  uint32_t length=bytes-part;if(length>P3R_DUMP_REGION_LIMIT)length=P3R_DUMP_REGION_LIMIT;
+                  p3r_dump_memory(d,p3r_capture_query,base+rva+part,length,36);
+                 }
+                }
+                if(!memcmp(hdr+off,".data",5) || !memcmp(hdr+off,".bss",4) ||
+                   !memcmp(hdr+off,".pdata",6) || !memcmp(hdr+off,".xdata",6))
+                 p3r_dump_memory(d,p3r_capture_query,base+rva,bytes,fex?32:33);
+               }
+              }
+             }
+            }
+            if(next==node)break;
+            node=next;
+           }
+          }
+          /* At most two snapshots per run. Their differences are retained, so an
+           * additional memory field can be examined offline without another Switch run. */
+          void wine_nx_p3r_autopsy(uint64_t tid,uint64_t object,uint64_t key)
+          {
+           static unsigned captures;static uint64_t last_tick;static int busy;
+           struct p3r_dump dump;Handle paused[NX_PROF_MAX_THREADS],self=threadGetCurHandle();unsigned i,n=0,pass;
+           uint64_t now=armGetSystemTick(),teb=0;
+           char path[160],message[240];FILE *file;size_t written=0;
+           if(__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE))return;
+           if(captures>=2 || (last_tick && armTicksToNs(now-last_tick)<20000000000ULL)){__atomic_store_n(&busy,0,__ATOMIC_RELEASE);return;}
+           last_tick=now;captures++;
+           p3r_dump_begin(&dump,p3r_dump_buffer,sizeof(p3r_dump_buffer),now);
+           {static const char build[]=P3R_UNIFIED_BUILD_ID;
+            uint64_t wait[3]={tid,object,key};
+            p3r_dump_add(&dump,P3R_DUMP_BUILD,0,runtime_base,build,sizeof(build));
+            p3r_dump_add(&dump,P3R_DUMP_WAIT,0,0,wait,sizeof(wait));}
+           pthread_mutex_lock(&profile_mutex);
+           /* No target is paused while acquiring a host lock. No IO/allocation or
+            * Windows API is called until every successfully paused target is resumed. */
+           memset(p3r_saved_valid,0,sizeof(p3r_saved_valid));
+           for(i=0;i<NX_PROF_MAX_THREADS;i++) {
+            Handle h=registry[i].handle;
+            if(!h || h==self)continue;
+            if(R_SUCCEEDED(svcSetThreadActivity(h,ThreadActivity_Paused)))paused[n++]=h;
+            else {uint64_t failure[2]={registry[i].tid,h};p3r_dump_add(&dump,P3R_DUMP_ERROR,40,0,failure,sizeof(failure));}
+           }
+           for(i=0;i<NX_PROF_MAX_THREADS;i++) {
+            Handle h=registry[i].handle;unsigned j;
+            for(j=0;j<n && paused[j]!=h;j++) {}
+            if(j==n)continue;
+            if(R_FAILED(svcGetThreadContext3(p3r_saved_context+i,h))) {
+             uint64_t failure[2]={registry[i].tid,h};p3r_dump_add(&dump,P3R_DUMP_ERROR,41,0,failure,sizeof(failure));continue;
+            }
+            p3r_saved_valid[i]=1;
+            p3r_dump_add(&dump,P3R_DUMP_CONTEXT,registry[i].tid | ((unsigned char)registry[i].kind<<24),registry[i].teb,p3r_saved_context+i,sizeof(ThreadContext));
+           }
+           /* Target thread first, then other Wine threads, then native/server threads.
+            * All CPU contexts are already retained even if the memory budget fills. */
+           for(pass=0;pass<3;pass++) for(i=0;i<NX_PROF_MAX_THREADS;i++) {
+            ThreadContext context;unsigned j;
+            uint64_t area=0,stack_top=0,stack_bottom=0;
+            unsigned priority=registry[i].tid==tid && registry[i].kind=='w'?0:registry[i].kind=='w'?1:2;
+            if(!p3r_saved_valid[i] || priority!=pass)continue;
+            context=p3r_saved_context[i];
+            p3r_dump_memory(&dump,p3r_capture_query,context.sp,256*1024,10);
+            if(registry[i].kind!='w' || !registry[i].teb)continue;
+            if(!teb || registry[i].tid==tid)teb=registry[i].teb;
+            p3r_dump_memory(&dump,p3r_capture_query,registry[i].teb,8192,11);
+            if(p3r_dump_read(p3r_capture_query,registry[i].teb+8,&stack_top,8) &&
+               p3r_dump_read(p3r_capture_query,registry[i].teb+16,&stack_bottom,8) &&
+               stack_top>stack_bottom) {
+             uint64_t bytes=stack_top-stack_bottom;if(bytes>256*1024)bytes=256*1024;
+             p3r_dump_memory(&dump,p3r_capture_query,stack_top-bytes,bytes,12);
+            }
+            if(p3r_dump_read(p3r_capture_query,registry[i].teb+0x1788,&area,8) && area) {
+             unsigned char cpu[512];
+             p3r_dump_memory(&dump,p3r_capture_query,area,16384,13);
+             if(p3r_dump_read(p3r_capture_query,area,cpu,sizeof(cpu))) {
+              for(j=0;j<sizeof(cpu);j+=8) {
+               uint64_t pointer;memcpy(&pointer,cpu+j,8);
+               if(pointer>65536 && pointer<0x8000000000ULL && !(pointer&7))
+                p3r_dump_memory(&dump,p3r_capture_query,pointer,16384,14);
+              }
+             }
+            }
+           }
+           if(teb)p3r_capture_modules(&dump,teb);
+           if(object)p3r_dump_memory(&dump,p3r_capture_query,object&~4095ULL,16384,20);
+           if(key)p3r_dump_memory(&dump,p3r_capture_query,key&~4095ULL,16384,21);
+           /* Store the virtual memory map, including permissions and inaccessible holes. */
+           {uint64_t at=0;unsigned steps;
+            for(steps=0;at<0x8000000000ULL && steps<16384;steps++) {
+             uint64_t base,size,row[4];unsigned perm,type;
+             if(!p3r_capture_query(at,&base,&size,&perm,&type) || !size || base>UINT64_MAX-size || base+size<=at)break;
+             row[0]=base;row[1]=size;row[2]=perm;row[3]=type;
+             if(!p3r_dump_add(&dump,P3R_DUMP_MAP,0,base,row,sizeof(row)))break;
+             at=base+size;
+            }
+           }
+           for(i=0;i<n;i++) {
+            Result rc=svcSetThreadActivity(paused[i],ThreadActivity_Runnable);
+            if(R_FAILED(rc))rc=svcSetThreadActivity(paused[i],ThreadActivity_Runnable);
+            if(R_FAILED(rc)){uint64_t failure[2]={paused[i],rc};p3r_dump_add(&dump,P3R_DUMP_ERROR,42,0,failure,sizeof(failure));}
+           }
+           pthread_mutex_unlock(&profile_mutex);
+           p3r_dump_end(&dump);
+           snprintf(path,sizeof(path),"sdmc:/switch/wine/logs/p3r-autopsy-%u.p3rdump",captures);
+           if((file=fopen(path,"wb"))) {written=fwrite(dump.data,1,dump.used,file);if(fclose(file))written=0;}
+           snprintf(message,sizeof(message),"[P3R-AUTOPSY] snapshot=%u bytes=%llu written=%llu records=%u truncated=%u path=%s",
+            captures,(unsigned long long)dump.used,(unsigned long long)written,dump.records,dump.truncated,path);
+           wine_nx_runtime_trace(message);
+           __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
+          }
+          P3R_UNIFIED_FILE_3_END
+          cat > "$CLOUD_ROOT/p3r-source/p3r_layout.h" <<'P3R_UNIFIED_FILE_4_END'
+          /* Exact published FEX module: 9dc979390ce95de8658af6fd418677416d563d0df613ecf1e257e3cd632afd76. No changed FEX DLL is installed. */
+          #define P3R_FEX_TIMESTAMP 0x6abfdf12u
+          #define P3R_FEX_IMAGE_SIZE 0x3d0000u
+          #define P3R_FEX_CTX_RVA 0x3a9450u
+          P3R_UNIFIED_FILE_4_END
+          cat > "$CLOUD_ROOT/p3r-source/patch_runtime.py" <<'P3R_UNIFIED_FILE_5_END'
           #!/usr/bin/env python3
           """Instrument only the pinned Autorun native runtime; leave wait semantics intact."""
           import argparse
@@ -500,6 +835,106 @@ jobs:
               return 1;
           }
           
+          #include "../../../horizon-wine/source/p3r_pe_wait.h"
+          
+          static int p3r_pe_native_read(void *ctx, uint64_t at, void *dst, unsigned size)
+          {
+              MemoryInfo info;
+              u32 page;
+              (void)ctx;
+              if (!size || at > UINT64_MAX-size ||
+                  R_FAILED(svcQueryMemory(&info,&page,at)) || !(info.perm & Perm_R) ||
+                  at < info.addr || info.size < size || at-info.addr > info.size-size) return 0;
+              memcpy(dst,(const void *)(uintptr_t)at,size);
+              return 1;
+          }
+          
+          /* Module naming through readable PE headers only. No virtual_mutex, loader
+           * lock or PE callback is entered while the target may own one of them. */
+          static void p3r_pe_name(uint64_t address, char *name, unsigned capacity)
+          {
+              uint64_t candidate=address & ~65535ULL;
+              unsigned count;
+              snprintf(name,capacity,"%#llx",(unsigned long long)address);
+              for (count=0;count<1024 && candidate;count++,candidate-=65536) {
+                  uint16_t mz,magic;
+                  uint32_t pe,sig,size,export_rva,export_name;
+                  char module[64];unsigned i;
+                  if (!p3r_pe_native_read(0,candidate,&mz,2) || mz!=0x5a4d ||
+                      !p3r_pe_native_read(0,candidate+0x3c,&pe,4) || pe>0x1000 ||
+                      !p3r_pe_native_read(0,candidate+pe,&sig,4) || sig!=0x4550 ||
+                      !p3r_pe_native_read(0,candidate+pe+24,&magic,2) || magic!=0x20b ||
+                      !p3r_pe_native_read(0,candidate+pe+24+56,&size,4) || size>0x4000000 ||
+                      address-candidate>=size || size<0x1000) continue;
+                  if (!p3r_pe_native_read(0,candidate+pe+24+112,&export_rva,4) ||
+                      !export_rva || export_rva>size-40 ||
+                      !p3r_pe_native_read(0,candidate+export_rva+12,&export_name,4) ||
+                      !export_name || export_name>=size) {
+                      snprintf(name,capacity,"PE@%#llx+%#llx",(unsigned long long)candidate,
+                               (unsigned long long)(address-candidate));return;
+                  }
+                  for (i=0;i<sizeof(module)-1 && export_name+i<size;i++) {
+                      if (!p3r_pe_native_read(0,candidate+export_name+i,module+i,1)) break;
+                      if (!module[i]) break;
+                      if ((unsigned char)module[i]<32 || (unsigned char)module[i]>126) break;
+                  }
+                  module[i]=0;
+                  snprintf(name,capacity,"%s@%#llx+%#llx",module[0]?module:"PE",
+                           (unsigned long long)candidate,(unsigned long long)(address-candidate));return;
+              }
+          }
+          
+          static void p3r_pe_report(uint64_t serial, unsigned tid)
+          {
+              static uint64_t reported[8];
+              static unsigned count;
+              struct p3r_pe_wait s;
+              uint64_t nt_base=0x180000000ULL;
+              char line[640],where[128],caller[128],upper[128];
+              unsigned i,found=0;
+              int result;
+              { extern void wine_nx_p3r_autopsy(uint64_t tid,uint64_t object,uint64_t key);
+                result=p3r_pe_find_wait(nt_base,tid,p3r_pe_native_read,0,&s);
+                wine_nx_p3r_autopsy(tid,result==1?(s.lock?s.lock:s.address):0,result==1?s.address:0); }
+              for (i=0;i<count;i++) if (reported[i]==serial) return;
+              if (count==8) return;
+              reported[count++]=serial;
+              if (result!=1) {
+                  snprintf(line,sizeof(line),"[P3R-PE-WAIT] tid=%u result=%s; no PE layout guessed",tid,
+                           result<0?"DLL-fingerprint-mismatch":"entry-not-found-or-changing");
+                  wine_nx_runtime_trace(line);return;
+              }
+              p3r_pe_name(s.address,where,sizeof(where));
+              p3r_pe_name(s.caller,caller,sizeof(caller));
+              p3r_pe_name(s.upper_return,upper,sizeof(upper));
+              snprintf(line,sizeof(line),"[P3R-PE-WAIT] tid=%u address=%#llx where=%s value_valid=%u value64=%#llx "
+                       "entry=%#llx caller=%s upper=%s kind=%u",tid,(unsigned long long)s.address,where,
+                       s.value_valid,(unsigned long long)s.value,(unsigned long long)s.entry,caller,upper,s.kind);
+              wine_nx_runtime_trace(line);
+              snprintf(line,sizeof(line),"[P3R-PE-LOCK] tid=%u lock=%#llx valid=%u value64=%#llx "
+                       "saved_x19=%#llx saved_x20=%#llx saved_x21=%#llx saved_x22=%#llx "
+                       "note=advisory-no-owner-inferred",tid,(unsigned long long)s.lock,s.lock_valid,
+                       (unsigned long long)s.lock_value,(unsigned long long)s.saved[0],(unsigned long long)s.saved[1],
+                       (unsigned long long)s.saved[2],(unsigned long long)s.saved[3]);
+              wine_nx_runtime_trace(line);
+              /* Bounded fallback above frame-pointer-free ARM64EC frames. These are
+               * executable BL/BLR return candidates, never claimed as unwound frames.
+               * No raw stack contents or arbitrary strings are emitted. */
+              for (i=0;i<512 && found<16;i++) {
+                  uint64_t at=s.caller_sp+i*8ULL,value;
+                  MemoryInfo info;u32 page,instruction;
+                  if (at<s.caller_sp || !p3r_pe_read64(p3r_pe_native_read,0,at,&value)) break;
+                  if (value<4 || value>=0x8000000000ULL || (value&3) ||
+                      R_FAILED(svcQueryMemory(&info,&page,value-4)) || !(info.perm&4) ||
+                      !p3r_pe_native_read(0,value-4,&instruction,4) ||
+                      ((instruction&0xfc000000)!=0x94000000 && (instruction&0xfffffc1f)!=0xd63f0000)) continue;
+                  p3r_pe_name(value,where,sizeof(where));
+                  snprintf(line,sizeof(line),"[P3R-PE-CANDIDATE] tid=%u slot=%#llx value=%s "
+                           "note=stack-code-candidate-not-unwound",tid,(unsigned long long)at,where);
+                  wine_nx_runtime_trace(line);found++;
+              }
+          }
+          
           void horizon_p3r_report_waits(void)
           {
               struct p3r_diag_snapshot current, events[P3R_DIAG_SLOTS], swap;
@@ -534,6 +969,7 @@ jobs:
                                 (unsigned long long)word );
                       wine_nx_runtime_trace( line );
                   }
+                  if (current.kind == 1) p3r_pe_report(current.serial, (unsigned)current.tid);
                   /* Retained wake requests for this address, including kernel result. */
                   for (j = 0; j < P3R_DIAG_SLOTS; ++j) {
                       struct p3r_diag_snapshot wake;
@@ -584,6 +1020,8 @@ jobs:
           def patch(root, header, output, build_id='local-test'):
               if not re.fullmatch(r'[A-Za-z0-9-]{1,64}', build_id):
                   raise ValueError('Unsafe diagnostic build identifier')
+              pe_header = header.with_name('p3r_pe_wait.h').read_bytes()
+              extras={name:header.with_name(name).read_bytes() for name in ['p3r_dump.h','p3r_autopsy.inc','p3r_layout.h']}
               originals = {}
               for name, digest in LOCKS.items():
                   b = (root / name).read_bytes()
@@ -605,7 +1043,21 @@ jobs:
                                      '            { extern void horizon_p3r_report_waits(void); horizon_p3r_report_waits(); }')
               runtime = replace_once(runtime, '    log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );',
                                      '    log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );\n'
-                                     f'    log_line( "[P3R-DIAG] wait-snapshot-r1 id={build_id}; native observation only" );')
+                                     f'    log_line( "[P3R-DIAG] wait-snapshot-r3 id={build_id}; native observation only" );')
+              runtime = replace_once(runtime, '/* The sampler finds an x86 context through these without Wine\'s headers. */',
+                  'C_ASSERT( FIELD_OFFSET( TEB, Tib.StackBase ) == 8 );\n'
+                  'C_ASSERT( FIELD_OFFSET( TEB, Tib.StackLimit ) == 16 );\n'
+                  'C_ASSERT( FIELD_OFFSET( TEB, Peb ) == 0x60 );\n'
+                  'C_ASSERT( FIELD_OFFSET( PEB, LdrData ) == 0x18 );\n'
+                  'C_ASSERT( FIELD_OFFSET( PEB_LDR_DATA, InLoadOrderModuleList ) == 0x10 );\n'
+                  'C_ASSERT( FIELD_OFFSET( LDR_DATA_TABLE_ENTRY, DllBase ) == 0x30 );\n'
+                  'C_ASSERT( FIELD_OFFSET( LDR_DATA_TABLE_ENTRY, SizeOfImage ) == 0x40 );\n'
+                  'C_ASSERT( FIELD_OFFSET( LDR_DATA_TABLE_ENTRY, BaseDllName ) == 0x58 );\n'
+                  '/* The sampler finds an x86 context through these without Wine\'s headers. */')
+              runtime = replace_once(runtime, '    wine_nx_runtime_network_init();',
+                                     '    wine_nx_runtime_network_init();\n'
+                                     '    remove("sdmc:/switch/wine/logs/p3r-autopsy-1.p3rdump");\n'
+                                     '    remove("sdmc:/switch/wine/logs/p3r-autopsy-2.p3rdump");')
               modified['horizon-wine/source/runtime.c'] = runtime
           
               horizon = modified['dlls/ntdll/unix/horizon.c']
@@ -679,6 +1131,7 @@ jobs:
                   '                       (unsigned long long)ctx.cpu_gprs[0].x, (unsigned long long)ctx.cpu_gprs[1].x,\n'
                   '                       (unsigned long long)ctx.cpu_gprs[2].x, (unsigned long long)ctx.cpu_gprs[3].x );\n'
                   '        for (f = 0; f < frames; f++)')
+              profile=f'#define P3R_UNIFIED_BUILD_ID "{build_id}"\n'+profile+'\n#include "p3r_autopsy.inc"\n'
               modified['horizon-wine/source/thread_profile.c'] = profile
               # All source checks/anchors passed before any files are written.
               output.mkdir(parents=True, exist_ok=True)
@@ -689,13 +1142,25 @@ jobs:
                                                        fromfile='a/'+name, tofile='b/'+name))
               target = root / 'horizon-wine/source/p3r_wait_diag.h'
               target.write_bytes(header.read_bytes())
+              (root / 'horizon-wine/source/p3r_pe_wait.h').write_bytes(pe_header)
+              for name,data in extras.items(): (root / 'horizon-wine/source'/name).write_bytes(data)
               diff += ''.join(difflib.unified_diff([], target.read_text().splitlines(True),
                                                   fromfile='/dev/null', tofile='b/horizon-wine/source/p3r_wait_diag.h'))
+              diff += ''.join(difflib.unified_diff([], pe_header.decode().splitlines(True),
+                                                  fromfile='/dev/null', tofile='b/horizon-wine/source/p3r_pe_wait.h'))
+              for name,data in extras.items():
+                  diff+=''.join(difflib.unified_diff([],data.decode().splitlines(True),fromfile='/dev/null',tofile='b/horizon-wine/source/'+name))
               (output / 'p3r-wait-diagnostic.patch').write_text(diff)
               (output / 'p3r-wait-source-lock.json').write_text(json.dumps({
-                  'revision': '1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877', 'diagnostic': 'wait-snapshot-r1',
+                  'revision': '1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877', 'diagnostic': 'wait-snapshot-r3',
                   'build_id': build_id,
                   'original_sources': LOCKS,
+                  'snapshot_format': 'P3RDMP1 little endian, bounded 16 MiB, two snapshots per launch',
+                  'transport': 'USB/card only; no network listener or session key',
+                  'extra_headers': {name:hashlib.sha256(data).hexdigest() for name,data in extras.items()},
+                  'pe_header_sha256': hashlib.sha256(pe_header).hexdigest(),
+                  'pe_dll_sha256': '9b60d0f0e9da75e05fa390fd4445982ad8cf5be452638e2e0b1c5aa412561444',
+                  'pe_layout': 'native ARM64EC ntdll at 0x180000000; fingerprint checked before reading queues',
                   'header_sha256': hashlib.sha256(header.read_bytes()).hexdigest(),
                   'patched_sources': {name: hashlib.sha256(text.encode()).hexdigest() for name,text in modified.items()},
                   'changes_wait_results_or_timeout_arguments': False,
@@ -711,8 +1176,8 @@ jobs:
               parser.add_argument('--build-id', default='local-test')
               args = parser.parse_args()
               patch(args.root, args.header, args.output, args.build_id)
-          P3R_FILE_1_END
-          cat > "$CLOUD_ROOT/p3r-source/run_checks.py" <<'P3R_FILE_2_END'
+          P3R_UNIFIED_FILE_5_END
+          cat > "$CLOUD_ROOT/p3r-source/run_checks.py" <<'P3R_UNIFIED_FILE_6_END'
           #!/usr/bin/env python3
           """Host checks for the exact patched futex wrapper; not a Switch runtime test."""
           import argparse
@@ -721,6 +1186,7 @@ jobs:
           import json
           import os
           import sys
+          import struct
           from pathlib import Path
           import subprocess
           
@@ -731,6 +1197,7 @@ jobs:
           
           def check(root, source, output):
               output.mkdir(parents=True,exist_ok=True)
+              assert (root/'horizon-wine/source/p3r_pe_wait.h').read_bytes()==(source/'p3r_pe_wait.h').read_bytes(), 'PE header differs'
               assert (root/'horizon-wine/source/p3r_wait_diag.h').read_bytes()==(source/'p3r_wait_diag.h').read_bytes(), 'Patched header differs from tested source'
               patcher=load_module('patcher',source/'patch_runtime.py')
               symbol=load_module('symbol',source/'symbolicate_profile.py')
@@ -739,6 +1206,8 @@ jobs:
               end=horizon.index('/* Monotonic time since boot',begin)
               helper=patcher.NATIVE_HELPERS.replace(
                   '#include "../../../horizon-wine/source/p3r_wait_diag.h"','#include "p3r_wait_diag.h"'
+              ).replace(
+                  '#include "../../../horizon-wine/source/p3r_pe_wait.h"','#include "p3r_pe_wait.h"'
               ).replace('void horizon_p3r_report_waits(void)','static void horizon_p3r_report_waits(void)')
               wrapper=output/'futex_wrapper.c'
               native_wrapper=horizon[begin:end]
@@ -754,8 +1223,28 @@ jobs:
                                     'void wine_nx_quit_point(void) { wine_nx_quit_requested=0; }\n')
               cc=os.environ.get('CC','cc')
               compiler_version=subprocess.check_output([cc,'--version'],text=True).splitlines()[0]
+              pe_file=root/'horizon-dlls/switch/wine/drive_c/windows/system32/ntdll.dll'
+              raw=pe_file.read_bytes()
+              assert hashlib.sha256(raw).hexdigest()=='9b60d0f0e9da75e05fa390fd4445982ad8cf5be452638e2e0b1c5aa412561444', 'PE decoder requires the physical DLL fingerprint'
+              pe=struct.unpack_from('<I',raw,0x3c)[0]
+              sections,optional=struct.unpack_from('<H',raw,pe+6)[0],struct.unpack_from('<H',raw,pe+20)[0]
+              size=struct.unpack_from('<I',raw,pe+24+56)[0]
+              image=bytearray(size);headers=struct.unpack_from('<I',raw,pe+24+60)[0];image[:headers]=raw[:headers]
+              for index in range(sections):
+                  section=pe+24+optional+40*index
+                  virtual,raw_size,offset=struct.unpack_from('<III',raw,section+12)
+                  assert virtual+raw_size<=size
+                  image[virtual:virtual+raw_size]=raw[offset:offset+raw_size]
+              pe_image=output/'pe-ntdll-image.bin';pe_image.write_bytes(image)
+              # Independent frame evidence from the actual pinned machine code, including
+              # saved LR slots and native queue base. No game files are read by this check.
+              for offset,word in {0xd0d88:0xd10203ff,0xd0d98:0xf9003bfe,0xd0cc4:0xd100c3ff,
+                                  0xd0ccc:0xa9027bf5,0xd1048:0xd10083ff,0xd1050:0xf9000ffe,
+                                  0xd14fc:0xa9027bf5,0xd1554:0xd10183ff,0xd1564:0xa9057bfb}.items():
+                  assert struct.unpack_from('<I',image,offset)[0]==word, f'Native frame mismatch at {offset:x}'
               results=[]
               for name, files in [('wait_registry',[source/'test_wait_diag.c']),
+                                  ('pe_wait_decoder',[source/'test_pe_wait.c']),
                                   ('futex_wrapper_hooks_present',[wrapper,quit_stubs]),
                                   ('futex_wrapper_hooks_absent',[wrapper])]:
                   binary=output/name
@@ -766,7 +1255,8 @@ jobs:
                       linker=['-Wl,-U,_wine_nx_quit_requested','-Wl,-U,_wine_nx_quit_point']
                   subprocess.run([cc,'-std=c11','-O2','-Wall','-Wextra','-Werror','-pthread','-I',str(source),
                                   *map(str,files),*linker,'-o',str(binary)],check=True)
-                  result=subprocess.check_output([str(binary)],text=True).strip()
+                  arguments=[str(pe_image)] if name=='pe_wait_decoder' else []
+                  result=subprocess.check_output([str(binary),*arguments],text=True).strip()
                   print(name+': '+result);results.append(name+': '+result)
               # Exercise the actual scheduling expression extracted from the patched source.
               runtime=(root/'horizon-wine/source/runtime.c').read_text()
@@ -778,7 +1268,7 @@ jobs:
               assert snapshots[:7]==[10,15,20,30,60,90,120] and 180 in snapshots and 240 in snapshots
               results.append('PASS: native snapshots continue through 30/60/90/120/180/240 seconds')
               table={'build_id':'test-1','runtime_sha256':'test','symbols':[{'address':0x100,'size':0x80,'name':'horizon_futex_wait'},{'address':0x200,'size':0x40,'name':'alert_wait'}]}
-              text='[P3R-DIAG] wait-snapshot-r1 id=test-1; native observation only\n[PROF] 4w callers: +0x120<+0x218 100.0%\n'
+              text='[P3R-DIAG] wait-snapshot-r3 id=test-1; native observation only\n[PROF] 4w callers: +0x120<+0x218 100.0%\n'
               decoded=symbol.symbolicate(table,text)
               assert [r['symbol'] for r in decoded['addresses']]==['horizon_futex_wait+0x20','alert_wait+0x18']
               late=text+'[PROF] sampler started: runtime 0x1000000-0x1001000\n[STALL] thread 4w at 0x1000120 sp=0x2000 lr=0x1000218 < 0x1000120\n'
@@ -801,8 +1291,8 @@ jobs:
           if __name__=='__main__':
               p=argparse.ArgumentParser(description=__doc__);p.add_argument('root',type=Path);p.add_argument('source',type=Path);p.add_argument('output',type=Path)
               args=p.parse_args();check(args.root,args.source,args.output)
-          P3R_FILE_2_END
-          cat > "$CLOUD_ROOT/p3r-source/test_wait_diag.c" <<'P3R_FILE_3_END'
+          P3R_UNIFIED_FILE_6_END
+          cat > "$CLOUD_ROOT/p3r-source/test_wait_diag.c" <<'P3R_UNIFIED_FILE_7_END'
           #include <assert.h>
           #include <pthread.h>
           #include <stdio.h>
@@ -875,8 +1365,82 @@ jobs:
               printf("PASS: 160000 concurrent wait lifecycles, %u active and %u history snapshots; bounded overflow\n",active,events);
               return 0;
           }
-          P3R_FILE_3_END
-          cat > "$CLOUD_ROOT/p3r-source/futex_test_prefix.h" <<'P3R_FILE_4_END'
+          P3R_UNIFIED_FILE_7_END
+          cat > "$CLOUD_ROOT/p3r-source/test_pe_wait.c" <<'P3R_UNIFIED_FILE_8_END'
+          #include <assert.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include "p3r_pe_wait.h"
+          
+          static unsigned char image[0x1c0000], stack[8192], locks[4096];
+          static const uint64_t base=0x180000000ULL, stack_base=0x7fffc0e000ULL, lock_base=0x42001000;
+          static unsigned reads;
+          static int deny_stack;
+          static int read_memory(void *ctx,uint64_t at,void *out,unsigned size)
+          {
+              unsigned char *p=0;uint64_t start=0,length=0;
+              (void)ctx;reads++;
+              if (at>=base && at-base<sizeof(image)) {p=image;start=base;length=sizeof(image);}
+              else if (!deny_stack && at>=stack_base && at-stack_base<sizeof(stack)) {p=stack;start=stack_base;length=sizeof(stack);}
+              else if (at>=lock_base && at-lock_base<sizeof(locks)) {p=locks;start=lock_base;length=sizeof(locks);}
+              if (!p || size>length || at-start>length-size) return 0;
+              memcpy(out,p+(at-start),size);return 1;
+          }
+          static void write64(unsigned char *p,unsigned offset,uint64_t value){memcpy(p+offset,&value,8);}
+          static unsigned queue_for(uint64_t address){return (unsigned)((address>>4)&255);}
+          static void setup(uint64_t address,uint32_t caller)
+          {
+              uint64_t sp=stack_base+0x100,entry=sp+0x20;
+              unsigned q=queue_for(address),offset=0x166e60+q*24;
+              uint64_t head=base+offset,upper=0x1e92a01344ULL;
+              uint32_t tid=4;
+              memset(image+0x166e60,0,256*24);memset(stack,0,sizeof(stack));memset(locks,0,sizeof(locks));
+              write64(image,offset,entry);write64(image,offset+8,entry);
+              write64(stack,0x120,head);write64(stack,0x128,head);write64(stack,0x130,address);
+              memcpy(stack+0x138,&tid,4);
+              write64(stack,0x170,base+caller);
+              write64(stack,0x140,0x19191919);write64(stack,0x148,0x20202020);
+              write64(stack,0x150,0x21212121);write64(stack,0x158,0x22222222);
+              write64(stack,0x180+0x28,upper);write64(stack,0x180+0x18,upper);
+              write64(stack,0x180+0x58,upper);write64(locks,0,0x00010003);
+          }
+          int main(int argc,char **argv)
+          {
+              struct p3r_pe_wait s;
+              unsigned char *before;
+              unsigned i;
+              FILE *file;
+              const uint32_t callers[]={0xd0d30,0xd1098,0xd1530,0xd16dc,0xd1768,0xd17b0};
+              assert(argc==2);file=fopen(argv[1],"rb");assert(file);
+              assert(fread(image,1,sizeof(image),file)==sizeof(image));assert(!fclose(file));
+              assert(p3r_pe_fingerprint(base,read_memory,0));
+              for(i=0;i<sizeof(callers)/sizeof(callers[0]);i++) {
+                  uint64_t address=lock_base+((i==0||i==4)?2:0);
+                  setup(address,callers[i]);
+                  before=malloc(sizeof(image)+sizeof(stack)+sizeof(locks));assert(before);
+                  memcpy(before,image,sizeof(image));memcpy(before+sizeof(image),stack,sizeof(stack));
+                  memcpy(before+sizeof(image)+sizeof(stack),locks,sizeof(locks));
+                  assert(p3r_pe_find_wait(base,4,read_memory,0,&s)==1);
+                  assert(s.kind==i+1 && s.address==address && s.caller==base+callers[i]);
+                  assert(s.upper_return==0x1e92a01344ULL && s.saved[0]==0x19191919 && s.saved[3]==0x22222222);
+                  if(i==0 || i==1 || i==4 || i==5) assert(s.lock==lock_base && s.lock_valid && s.lock_value==0x10003);
+                  assert(!memcmp(before,image,sizeof(image)) && !memcmp(before+sizeof(image),stack,sizeof(stack)) &&
+                         !memcmp(before+sizeof(image)+sizeof(stack),locks,sizeof(locks)));free(before);
+              }
+              setup(lock_base,0xabcdef);assert(p3r_pe_find_wait(base,4,read_memory,0,&s)==1 && !s.kind && !s.upper_return);
+              assert(p3r_pe_find_wait(base,8,read_memory,0,&s)==0);
+              image[0xd0f7c]^=1;assert(p3r_pe_find_wait(base,4,read_memory,0,&s)==-1);image[0xd0f7c]^=1;
+              deny_stack=1;assert(p3r_pe_find_wait(base,4,read_memory,0,&s)==0);deny_stack=0;
+              write64(stack,0x120,stack_base+0x120);reads=0;
+              assert(p3r_pe_find_wait(base,4,read_memory,0,&s)==0 && reads<400);
+              setup(lock_base,0xd0d30);write64(stack,0x130,lock_base+16);
+              assert(p3r_pe_find_wait(base,4,read_memory,0,&s)==0);
+              assert(p3r_pe_find_wait(UINT64_MAX-8,4,read_memory,0,&s)==-1);
+              puts("PASS: real pinned PE fingerprint, six native SRW/CV frames, real key recovery, read-only memory, unknown caller, wrong thread/hash, corrupt DLL/list, unmapped stack, bounded reads, overflow rejection");
+              return 0;
+          }
+          P3R_UNIFIED_FILE_8_END
+          cat > "$CLOUD_ROOT/p3r-source/futex_test_prefix.h" <<'P3R_UNIFIED_FILE_9_END'
           
           #include <assert.h>
           #include <errno.h>
@@ -916,8 +1480,10 @@ jobs:
           static Result svcSignalToAddress(void *a,unsigned t,long long v,int count){
            assert(a && t==0 && v==0 && count==3);return 77;}
           
-          P3R_FILE_4_END
-          cat > "$CLOUD_ROOT/p3r-source/futex_test_main.inc" <<'P3R_FILE_5_END'
+          
+          void wine_nx_p3r_autopsy(uint64_t tid,uint64_t object,uint64_t key){(void)tid;(void)object;(void)key;}
+          P3R_UNIFIED_FILE_9_END
+          cat > "$CLOUD_ROOT/p3r-source/futex_test_main.inc" <<'P3R_UNIFIED_FILE_10_END'
           int main(void){
            int word=0;struct p3r_diag_snapshot s;unsigned i,seen=0;
            horizon_p3r_wait_context(1,0,0);errno=EBUSY;
@@ -944,8 +1510,8 @@ jobs:
             puts("PASS: missing weak quit hooks are skipped safely");
            }
            puts("PASS: unchanged infinite slices, finite timeout, success, EAGAIN, ETIMEDOUT, EINVAL; active capture and wake kernel result");return 0;}
-          P3R_FILE_5_END
-          cat > "$CLOUD_ROOT/p3r-source/symbolicate_profile.py" <<'P3R_FILE_6_END'
+          P3R_UNIFIED_FILE_10_END
+          cat > "$CLOUD_ROOT/p3r-source/symbolicate_profile.py" <<'P3R_UNIFIED_FILE_11_END'
           #!/usr/bin/env python3
           """Resolve only native runtime offsets, against the matching diagnostic build."""
           import argparse
@@ -967,7 +1533,7 @@ jobs:
           
           def symbolicate(table, text):
               build_id = table['build_id']
-              if f'[P3R-DIAG] wait-snapshot-r1 id={build_id};' not in text:
+              if f'[P3R-DIAG] wait-snapshot-r3 id={build_id};' not in text:
                   raise ValueError('Profile does not identify this diagnostic build; refusing to guess symbols')
               bounds=re.search(r'\[PROF\].*?runtime (0x[0-9a-fA-F]+)-(0x[0-9a-fA-F]+)',text)
               native_base,native_end=(int(v,16) for v in bounds.groups()) if bounds else (0,0)
@@ -998,8 +1564,8 @@ jobs:
               text=json.dumps(report,indent=2,ensure_ascii=False)+'\n'
               if args.output:args.output.write_text(text)
               else:print(text,end='')
-          P3R_FILE_6_END
-          cat > "$CLOUD_ROOT/p3r-source/collect_runtime.py" <<'P3R_FILE_7_END'
+          P3R_UNIFIED_FILE_11_END
+          cat > "$CLOUD_ROOT/p3r-source/collect_runtime.py" <<'P3R_UNIFIED_FILE_12_END'
           #!/usr/bin/env python3
           """Validate the complete build, then export only its NRO update and symbols."""
           import argparse
@@ -1022,8 +1588,8 @@ jobs:
               build_id=lock['build_id']
               with ZipFile(archives[0]) as z:
                   nro=z.read('switch/wine/wine-nx-runtime.nro')
-              marker=f'[P3R-DIAG] wait-snapshot-r1 id={build_id}; native observation only'.encode()
-              if marker not in nro or b'[P3R-WAIT]' not in nro:
+              marker=f'[P3R-DIAG] wait-snapshot-r3 id={build_id}; native observation only'.encode()
+              if marker not in nro or b'[P3R-WAIT]' not in nro or b'[P3R-PE-WAIT]' not in nro or b'[P3R-AUTOPSY]' not in nro:
                   raise ValueError('Diagnostic marker absent from the compiled NRO')
               digest=hashlib.sha256(nro).hexdigest()
               elf=root/'horizon-wine/build-switch-amd64/wine-nx-runtime.elf'
@@ -1033,12 +1599,12 @@ jobs:
               for line in nm.splitlines():
                   m=re.fullmatch(r'([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+([tTwW])\s+(.+)',line)
                   if m:symbols.append({'address':int(m[1],16),'size':int(m[2],16),'name':m[4]})
-              required={'horizon_futex_wait','horizon_p3r_report_waits','NtWaitForAlertByThreadId'}
+              required={'horizon_futex_wait','horizon_p3r_report_waits','NtWaitForAlertByThreadId','wine_nx_p3r_autopsy'}
               if not required.issubset({s['name'] for s in symbols}):
                   raise ValueError('Native ELF is stripped or incomplete; required wait symbols missing')
               out=cloud/'dist';out.mkdir(exist_ok=True)
-              symbols_dir=cloud/'symbols';symbols_dir.mkdir(exist_ok=True)
-              filename=f'Autorun_P3R_Runtime_Diagnostic_{build_id}.zip'
+              symbols_dir=out/'symbols';symbols_dir.mkdir(exist_ok=True)
+              filename='runtime-update.zip'
               with ZipFile(out/filename,'w',ZIP_DEFLATED,compresslevel=6) as z:
                   z.writestr('switch/wine/wine-nx-runtime.nro',nro)
               with ZipFile(out/filename) as z:
@@ -1048,37 +1614,84 @@ jobs:
               shutil.copy2(elf,symbols_dir/elf.name)
               (symbols_dir/'runtime-symbols.txt').write_text(nm)
               (symbols_dir/'runtime-symbols.json').write_text(json.dumps({'build_id':build_id,'runtime_sha256':digest,'symbols':symbols},indent=2)+'\n')
-              for name in ['symbolicate_profile.py','patch_runtime.py','p3r_wait_diag.h']:
+              for name in ['symbolicate_profile.py','patch_runtime.py','p3r_wait_diag.h','p3r_pe_wait.h','p3r_dump.h','p3r_autopsy.inc','p3r_layout.h']:
                   shutil.copy2(cloud/'p3r-source'/name,symbols_dir/name)
               for name in ['p3r-wait-source-lock.json','p3r-wait-diagnostic.patch','source-lock.json','cloud-portability.patch']:
                   shutil.copy2(cloud/'diagnostics'/name,symbols_dir/name)
-              instructions=f'''Диагностический Autorun для уже настроенной среды nx-amd64-fex-2640.
-          Сборка {build_id}; это сбор наблюдений, исправление зависания пока не заявлено.
+              for name in ['usb_station.py','analyze_dump.py','pe_symbols.py','symbolicate_profile.py']:
+                  shutil.copy2(cloud/'p3r-source'/name,out/name)
+              for name,expected in {'ntdll.dll':'9b60d0f0e9da75e05fa390fd4445982ad8cf5be452638e2e0b1c5aa412561444',
+                                    'libarm64ecfex.dll':'9dc979390ce95de8658af6fd418677416d563d0df613ecf1e257e3cd632afd76'}.items():
+                  dll=root/'horizon-dlls/switch/wine/drive_c/windows/system32'/name
+                  if hashlib.sha256(dll.read_bytes()).hexdigest()!=expected:raise ValueError('Exact PE symbols source mismatch: '+name)
+                  shutil.copy2(dll,symbols_dir/name)
+              command='#!/bin/bash\nset -euo pipefail\ncd -- "$(dirname -- "$0")"\nexec /usr/bin/python3 usb_station.py watch --runtime "'+filename+'" --report BUILD-REPORT.json --output "$HOME/Documents/p3p_modding/work/reload_switch_port/usb_sessions"\n'
+              (out/'P3R-USB.command').write_text(command)
+              (out/'P3R-USB.command').chmod(0o755)
+              mtp_command='''#!/bin/bash
+          set -euo pipefail
+          cd -- "$(dirname -- "$0")"
+          kit="$PWD"
+          session_output="$HOME/Documents/p3p_modding/work/reload_switch_port/usb_sessions"
+          /usr/bin/python3 usb_station.py prepare-mtp --runtime runtime-update.zip --report BUILD-REPORT.json --output "$kit"
+          mkdir -p MTP-inbox
+          echo 'Через OpenMTP сначала скопируй прежний SD:/switch/wine/wine-nx-runtime.nro в папку MTP-backup на Mac.'
+          echo "Затем скопируй $kit/MTP-update/wine-nx-runtime.nro в SD:/switch/wine/ с заменой. Дождись завершения."
+          echo 'Закрой MTP на Switch, запусти Persona на 2 минуты: Full, Profiler On, Verbose Off.'
+          echo "Закрой Autorun, открой MTP и скопируй всю SD:/switch/wine/logs в $kit/MTP-inbox/"
+          read -r -p 'Когда копирование полностью завершится, нажми Enter: ' reply
+          test -d MTP-inbox/logs || { echo 'Нет MTP-inbox/logs. Сначала скопируй папку logs через OpenMTP.'; exit 1; }
+          exec /usr/bin/python3 usb_station.py import --logs MTP-inbox/logs --output "$session_output"
+          '''
+              (out/'P3R-MTP.command').write_text(mtp_command)
+              (out/'P3R-MTP.command').chmod(0o755)
+              instructions=f'''Единый комплект P3R: снимки процесса, символы FEX/Wine и USB-станция.
+          Сборка {build_id}. Исправление зависания пока не заявлено.
           
-          1. Полностью закрыть Autorun. Сохранить прежний SD:/switch/wine/wine-nx-runtime.nro
-             на компьютере для отката.
-          2. Распаковать {filename} в корень SD с заменой ОДНОГО файла:
-             switch/wine/wine-nx-runtime.nro.
-          3. Запустить консоль через уже настроенную запись Hekate -> Autorun.
-             Повторный Quick setup не требуется. Загрузочные компоненты в этом ZIP отсутствуют.
-          4. У Persona: FEX_SMCCHECKS=Full, Profiler=On, Verbose traces=Off.
-             Остальные параметры сохранить. Запустить P3R на две минуты.
-          5. Полностью закрыть Autorun. Передать P3R_profiler.log из switch/wine/logs/.
-             В начале должен быть маркер [P3R-DIAG] wait-snapshot-r1 id={build_id};.
-          6. Для расшифровки адресов нужен парный artifact autorun-p3r-symbols того же
-             запуска GitHub Actions. Его сохранить на компьютере; на SD он не нужен.
+          Если карта уже видна в OpenMTP, используй P3R-MTP.command.
+          Он подготовит и проверит NRO в MTP-update/ на Mac, затем подскажет два переноса:
+          один NRO на SD и всю папку switch/wine/logs обратно в MTP-inbox/logs на Mac.
+          Перед заменой сохранить прежний NRO через OpenMTP в отдельную папку Mac.
+          После завершения копирования нажать Enter — скрипт сам разберёт и упакует
+          логи/снимки вместе с символами в один ZIP в папке проекта usb_sessions.
+          MTP не является томом /Volumes: P3R-USB.command его не обнаруживает.
+          Автоматическое чтение/запись самого MTP-устройства в этом комплекте не заявлено.
+          Во время игры MTP-режим на Switch должен быть закрыт.
           
-          Эта замена не требует копирования игры, EXE, DLL или повторной настройки памяти.
-          Она записывает текущее ожидание, тип, ключ, последние вызовы пробуждения и
-          поздние снимки потоков. История ограничена: отсутствие wake в ней само по себе
-          не доказывает, что сигнал никогда не посылался. Слово объекта читается как
-          диагностический снимок и может меняться; оно не является доказанным ID владельца.
+          Для обычного тома (кардридер/Hekate UMS):
+          1. Распаковать весь artifact в одну папку на Mac. Не копировать symbols на SD.
+          2. Полностью закрыть Autorun. Подключить SD через кардридер либо Hekate ->
+             Tools -> USB Tools -> SD Card. Карта должна появиться в Finder как том.
+          3. Запустить P3R-USB.command. Он найдёт карту с switch/wine, сохранит прежний
+             NRO в папке проекта work/reload_switch_port/usb_sessions/backups и установит один новый wine-nx-runtime.nro.
+             При нескольких картах он откажется выбирать; можно явно указать --sd.
+          4. Извлечь том средствами macOS, отключить USB и загрузить Hekate -> Autorun.
+             Quick setup повторять не надо. У P3R: Full, Profiler On, Verbose Off.
+          5. Запустить Persona на 2 минуты. При длительном ожидании сохранятся два
+             снимка (интервал не менее 20 с), каждый до 16 MiB. Затем закрыть Autorun.
+          6. Снова подключить SD к Mac тем же способом. Работающая USB-станция сама
+             заберёт снимки и логи в папке проекта work/reload_switch_port/usb_sessions/P3R-Diagnostics-...zip и разберёт адреса.
+             Тот же NRO повторно не записывается. Передать один получившийся ZIP.
           
-          Откат: вернуть сохраненный wine-nx-runtime.nro. На реальном Switch этот новый
-          NRO еще не проверен. Сборка и проверки на ПК не доказывают запуск P3R.
+          Если .command не открывается: в Terminal выполнить из папки комплекта:
+          python3 usb_station.py watch --runtime "{filename}" --report BUILD-REPORT.json
+          
+          Полный снимок содержит регистры зарегистрированных потоков, родные и x64
+          стеки, TEB/CPU area, данные FEX/Wine, исходный объект ожидания, память вокруг
+          него, PE-модули и карту памяти. Чтение ограничено; ошибки/усечение отмечаются.
+          Все успешно остановленные потоки возобновляются до форматирования и записи
+          на SD. Снимок можно заново разбирать на Mac без повторного запуска игры:
+          python3 analyze_dump.py sessions/ПАПКА/p3r-autopsy-1.p3rdump --symbols symbols
+          
+          Игра, её EXE/DLL, загрузочные компоненты и настройки ожиданий не меняются.
+          В комплекте нет сетевого сервера и нет ключа доступа. Он рассчитан на USB/SD.
+          Содержимое памяти относится к локальному игровому процессу; оно остаётся на
+          SD и Mac. Не публиковать полные снимки в открытых GitHub issues.
+          Откат: вернуть прежний NRO из папки usb_sessions/backups. Новый NRO пока не проверен
+          на физическом Switch; успешная облачная сборка не доказывает запуск P3R.
           '''
               (out/'INSTALL_RU.txt').write_text(instructions)
-              report={'diagnostic':'wait-snapshot-r1','build_id':build_id,'native_runtime_sha256':digest,
+              report={'diagnostic':'unified-autopsy-v1','build_id':build_id,'native_runtime_sha256':digest,
                       'native_runtime_bytes':len(nro),'native_symbols':len(symbols),'update_archive':filename,
                       'cloud_compilation_finished':True,'complete_upstream_package_validation':checked,
                       'switch_runtime_verified':False,'p3r_boot_verified':False,'deadlock_fix_claimed':False,
@@ -1086,14 +1699,522 @@ jobs:
               (out/'BUILD-REPORT.json').write_text(json.dumps(report,indent=2)+'\n')
               for folder in [out,symbols_dir]:
                   (folder/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in sorted(folder.iterdir()) if p.is_file() and p.name!='SHA256SUMS.txt'))
+              downloads=cloud/'download';downloads.mkdir(exist_ok=True)
+              bundle=downloads/f'P3R_Debugger_{build_id}.zip'
+              with ZipFile(bundle,'w',ZIP_DEFLATED,compresslevel=6) as z:
+                  for file in sorted(out.rglob('*')):
+                      if file.is_file():z.write(file,file.relative_to(out))
+              with ZipFile(bundle) as z:
+                  if z.testzip():raise ValueError('Debugger bundle CRC mismatch')
+                  command=z.getinfo('P3R-USB.command')
+                  if not (command.external_attr>>16)&0o111:raise ValueError('USB launcher executable mode lost')
+                  if not (z.getinfo('P3R-MTP.command').external_attr>>16)&0o111:raise ValueError('MTP launcher executable mode lost')
               print(json.dumps(report,indent=2))
           
           if __name__=='__main__':
               p=argparse.ArgumentParser(description=__doc__);p.add_argument('root',type=Path);p.add_argument('cloud',type=Path);p.add_argument('llvm',type=Path)
               args=p.parse_args();collect(args.root,args.cloud,args.llvm)
-          P3R_FILE_7_END
+          P3R_UNIFIED_FILE_12_END
+          cat > "$CLOUD_ROOT/p3r-source/usb_station.py" <<'P3R_UNIFIED_FILE_13_END'
+          #!/usr/bin/env python3
+          """Collect P3R diagnostics and optionally update one NRO on a USB-mounted SD.
+          No game files, firmware, boot entries or other homebrew files are modified.
+          """
+          import argparse,hashlib,json,os,re,shutil,sys,time,uuid
+          from pathlib import Path
+          from zipfile import ZipFile,ZIP_DEFLATED
+          
+          NRO_MEMBER='switch/wine/wine-nx-runtime.nro'
+          
+          def digest(p):
+           h=hashlib.sha256()
+           with p.open('rb') as f:
+            for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
+           return h.hexdigest()
+          
+          def sd_wine(sd):
+           sd=sd.absolute();wine=sd/'switch/wine'
+           for p in [sd,sd/'switch',wine]:
+            if p.is_symlink():raise ValueError('Refusing symlink in SD path')
+           if not wine.is_dir():raise ValueError('Selected volume does not contain switch/wine')
+           return wine
+          
+          def collect(sd,output):
+           wine=sd_wine(sd);logs=wine/'logs'
+           trace=wine/'drive_c/P3R_trace.txt'
+           if (wine/'drive_c').is_symlink():trace=None
+           return collect_logs(logs,output,trace)
+          
+          def collect_logs(logs,output,trace=None):
+           """Import a completed OpenMTP copy, or the logs directory on a mounted SD."""
+           if logs.is_symlink():raise ValueError('Logs directory is a symlink')
+           if not logs.is_dir():raise ValueError('Logs directory does not exist')
+           stamp=time.strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6]
+           folder=output/('P3R-Diagnostics-'+stamp);folder.mkdir(parents=True)
+           wanted=[]
+           if logs.is_dir():
+            for p in logs.iterdir():
+             if p.name in ['autorun_runtime.log','autorun-setup.log','horizon-trace.log','stdout.txt','stderr.txt'] or re.fullmatch(r'P3R[^/]*\.log|p3r-autopsy-[12]\.p3rdump',p.name):wanted.append(p)
+           if trace is not None and trace.is_file():wanted.append(trace)
+           manifest={'collected_at':stamp,'files':{},'skipped':{},'switch_files_modified':False}
+           for p in sorted(wanted):
+            if p.is_symlink() or not p.is_file():manifest['skipped'][p.name]='not a regular file';continue
+            if p.stat().st_size>64*1024*1024:manifest['skipped'][p.name]='larger than 64 MiB';continue
+            dst=folder/p.name;shutil.copyfile(p,dst)
+            source_hash=digest(p)
+            if digest(dst)!=source_hash:raise IOError('Readback mismatch while collecting '+p.name)
+            manifest['files'][p.name]={'bytes':dst.stat().st_size,'sha256':source_hash,'source_mtime_ns':p.stat().st_mtime_ns}
+           (folder/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+           archive=folder.with_suffix('.zip')
+           with ZipFile(archive,'w',ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(folder.iterdir()):z.write(p,p.name)
+           with ZipFile(archive) as z:
+            if z.testzip():raise IOError('Corrupt collected ZIP')
+           return folder,archive
+          
+          def verified_runtime(runtime,report):
+           expected=report.get('native_runtime_sha256','')
+           if not re.fullmatch('[0-9a-f]{64}',expected):raise ValueError('A matching BUILD-REPORT.json is required')
+           with ZipFile(runtime) as z:
+            if z.namelist()!=[NRO_MEMBER]:raise ValueError('Runtime ZIP must contain exactly one known NRO')
+            entry=z.getinfo(NRO_MEMBER)
+            if entry.file_size>128*1024*1024 or (entry.external_attr>>16)&0o170000==0o120000:raise ValueError('Invalid NRO archive member')
+            data=z.read(NRO_MEMBER)
+           if len(data)<128 or data[16:20]!=b'NRO0' or b'[P3R-AUTOPSY]' not in data:raise ValueError('Not the unified diagnostic NRO')
+           if hashlib.sha256(data).hexdigest()!=expected:raise ValueError('NRO does not match build report')
+           return data,expected
+          
+          def prepare_mtp(runtime,report,output):
+           data,expected=verified_runtime(runtime,report)
+           folder=output/'MTP-update';folder.mkdir(parents=True,exist_ok=True)
+           target=folder/'wine-nx-runtime.nro'
+           if folder.is_symlink() or target.is_symlink():raise ValueError('MTP update path is a symlink')
+           target.write_bytes(data)
+           if digest(target)!=expected:raise IOError('Local MTP update readback mismatch')
+           return target
+          
+          def install(sd,runtime,report,output):
+           wine=sd_wine(sd);target=wine/'wine-nx-runtime.nro'
+           data,expected=verified_runtime(runtime,report)
+           if target.is_symlink() or not target.is_file():raise ValueError('Existing NRO must be a regular file')
+           old=digest(target)
+           if old==expected:return {'changed':False,'sha256':old}
+           backups=output/'backups';backups.mkdir(parents=True,exist_ok=True)
+           backup=backups/(old+'.nro')
+           if not backup.exists():shutil.copyfile(target,backup)
+           if digest(backup)!=old:raise IOError('Original NRO backup could not be verified')
+           stage=wine/('.p3r-update-'+uuid.uuid4().hex+'.tmp')
+           try:
+            with stage.open('xb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+            if digest(stage)!=expected:raise IOError('Staged NRO readback mismatch')
+            os.replace(stage,target)
+            if digest(target)!=expected:raise IOError('Installed NRO readback mismatch; verified original remains in backup')
+           finally:
+            if stage.exists():stage.unlink()
+           return {'changed':True,'sha256':expected,'backup':str(backup),'only_sd_file_modified':str(target)}
+          
+          def mounted(volumes):
+           found=[]
+           for p in volumes.iterdir():
+            if p.is_symlink():continue
+            try:
+             if (p/'switch/wine/wine-nx-runtime.nro').is_file():sd_wine(p);found.append(p)
+            except (PermissionError,OSError,ValueError):continue
+           return found
+          
+          def main():
+           p=argparse.ArgumentParser(description=__doc__)
+           p.add_argument('mode',choices=['collect','install','watch','import','prepare-mtp']);p.add_argument('--sd',type=Path);p.add_argument('--logs',type=Path);p.add_argument('--volumes',type=Path,default=Path('/Volumes'))
+           p.add_argument('--runtime',type=Path);p.add_argument('--report',type=Path);p.add_argument('--output',type=Path,default=Path(__file__).resolve().parent/'sessions')
+           a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
+           if a.runtime and not a.report:p.error('--runtime requires --report')
+           if a.mode in ['install','prepare-mtp'] and not a.runtime:p.error('install/prepare-mtp requires --runtime and --report')
+           if a.mode=='import' and not a.logs:p.error('import requires --logs pointing to a completed local OpenMTP copy')
+           if a.mode=='import' and a.runtime:p.error('import never installs a runtime')
+           if a.mode=='prepare-mtp':
+            print('Готовый NRO для OpenMTP:',prepare_mtp(a.runtime,json.loads(a.report.read_text()),a.output));return
+           def process(sd):
+            folder,archive=collect_logs(a.logs,a.output) if a.mode=='import' else collect(sd,a.output)
+            try:
+             from analyze_dump import Snapshot,analyze
+             for dump in folder.glob('*.p3rdump'):
+              result=analyze(Snapshot(dump),Path(__file__).resolve().parent/'symbols')
+              decoded=dump.with_suffix('.analysis.json');decoded.write_text(json.dumps(result,indent=2,ensure_ascii=False)+'\n')
+              with ZipFile(archive,'a',ZIP_DEFLATED) as z:z.write(decoded,decoded.name)
+            except (OSError,ValueError,KeyError) as e:
+             (folder/'analysis-error.txt').write_text(str(e)+'\n')
+             print('Снимок сохранён; автоматический разбор неполон:',str(e),flush=True)
+            symbol_root=Path(__file__).resolve().parent/'symbols'
+            with ZipFile(archive,'a',ZIP_DEFLATED,compresslevel=6) as z:
+             for name in ['runtime-symbols.json','wine-nx-runtime.elf','ntdll.dll','libarm64ecfex.dll','source-lock.json','p3r-wait-source-lock.json']:
+              item=symbol_root/name
+              if item.is_file() and not item.is_symlink():z.write(item,'symbols/'+name)
+            print('Диагностика сохранена:',archive,flush=True)
+            if a.runtime:
+             report=json.loads(a.report.read_text())
+             result=install(sd,a.runtime,report,a.output)
+             (folder/'installation.json').write_text(json.dumps(result,indent=2)+'\n')
+             print('NRO обновлён, прежний сохранён в backups.' if result['changed'] else 'На карте уже стоит этот NRO.',flush=True)
+            if a.mode!='import':print('Можно безопасно извлечь карту средствами macOS и запустить Persona.',flush=True)
+           if a.mode=='import':process(None);return
+           if a.mode!='watch':
+            roots=[a.sd] if a.sd else mounted(a.volumes)
+            if len(roots)!=1:p.error('Specify --sd; exactly one Switch SD must be mounted')
+            process(roots[0]);return
+           print('Ожидаю SD в /Volumes. Подключи карту или включи Hekate -> Tools -> USB Tools -> SD Card.',flush=True)
+           present=set()
+           while True:
+            roots=[a.sd] if a.sd and a.sd.exists() else [] if a.sd else mounted(a.volumes)
+            if len(roots)>1:print('Подключено несколько Switch SD; используй --sd.',flush=True);time.sleep(3);continue
+            now=set(roots)
+            for root in now-present:
+             try:process(root)
+             except (OSError,ValueError) as e:print('Операция остановлена:',str(e),flush=True)
+            present=now;time.sleep(2)
+          if __name__=='__main__':
+           try:main()
+           except KeyboardInterrupt:print('\nОстановлено.')
+          P3R_UNIFIED_FILE_13_END
+          cat > "$CLOUD_ROOT/p3r-source/analyze_dump.py" <<'P3R_UNIFIED_FILE_14_END'
+          #!/usr/bin/env python3
+          """Decode the saved process snapshot offline. No running Switch required."""
+          import argparse,bisect,json,struct
+          from pathlib import Path
+          from pe_symbols import table,resolve
+          
+          class Snapshot:
+           def __init__(self,path):
+            data=Path(path).read_bytes()
+            if len(data)>16*1024*1024 or len(data)<40:raise ValueError('Invalid dump size')
+            magic,version,count,self.tick,self.flags,total=struct.unpack_from('<8sIIQQQ',data)
+            if magic!=b'P3RDMP1\0' or version!=1 or total!=len(data):raise ValueError('Invalid dump header or incomplete copy')
+            self.records=[];pos=40
+            for _ in range(count):
+             if pos>len(data)-24:raise ValueError('Truncated record')
+             typ,tag,addr,size=struct.unpack_from('<IIQQ',data,pos);pos+=24
+             if size>len(data)-pos:raise ValueError('Record outside dump')
+             self.records.append((typ,tag,addr,data[pos:pos+size]));pos+=size
+            if pos!=len(data):raise ValueError('Unexpected trailing data')
+            self.mem=[(addr,body) for typ,tag,addr,body in self.records if typ==2]
+            self.modules=[]
+            for typ,tag,addr,body in self.records:
+             if typ==6 and len(body)==144:
+              base,size=struct.unpack_from('<QQ',body);name=body[16:].decode('utf-16le').split('\0',1)[0]
+              self.modules.append({'name':name,'base':base,'size':size})
+           def read(self,address,size):
+            if size<0 or size>1024*1024:raise ValueError('Read limit')
+            out=bytearray()
+            while len(out)<size:
+             a=address+len(out)
+             for base,data in self.mem:
+              if base<=a<base+len(data):
+               n=min(size-len(out),base+len(data)-a);out.extend(data[a-base:a-base+n]);break
+             else:raise KeyError('Address not captured: '+hex(a))
+            return bytes(out)
+           def u64(self,address):return struct.unpack('<Q',self.read(address,8))[0]
+          
+          def analyze(s,symbol_dir):
+           cache={};missing=[]
+           build=next((body.rstrip(b'\0').decode(errors='replace') for typ,tag,addr,body in s.records if typ==5),'unknown')
+           native_base=next((addr for typ,tag,addr,body in s.records if typ==5),0)
+           native=None
+           try:
+            native=json.loads((symbol_dir/'runtime-symbols.json').read_text())
+            if native['build_id']!=build:native=None;missing.append('Native symbols do not match build')
+           except OSError:pass
+           def name(address):
+            for m in s.modules:
+             if m['base']<=address<m['base']+m['size']:
+              module=m['name'];file=symbol_dir/module.lower()
+              if module not in cache:
+               try:cache[module]=table(file)
+               except (OSError,ValueError):cache[module]=None
+              r=resolve(cache[module],address-m['base']) if cache[module] else None
+              return {'address':hex(address),'module':module,'rva':hex(address-m['base']),'symbol':r}
+            if native and native_base and address>=native_base:
+             from symbolicate_profile import resolve as resolve_native
+             found=resolve_native(native['symbols'],address-native_base)
+             if found!='unresolved':return {'address':hex(address),'module':'wine-nx-runtime.nro','rva':hex(address-native_base),'symbol':found}
+            return {'address':hex(address)}
+           contexts=[]
+           for typ,tag,addr,body in s.records:
+            if typ!=1 or len(body)<264:continue
+            fp,lr,sp,pc=struct.unpack_from('<QQQQ',body,29*8)
+            contexts.append({'tid':tag&0xffffff,'kind':chr(tag>>24),'teb':hex(addr),'pc':name(pc),'lr':name(lr),'fp':hex(fp),'sp':hex(sp),
+             'registers_x0_x28':list(map(hex,struct.unpack_from('<29Q',body))),
+             'note':'Kernel context may omit volatile registers while stopped in an SVC'})
+           waits=[]
+           nt=next((m for m in s.modules if m['name'].lower()=='ntdll.dll'),None)
+           if nt:
+            base=nt['base'];heads=base+0x166e60
+            try:
+             # Exact native layout, checked against the actual captured code/header identity
+             # by the runtime decoder; this parser also checks signature at the return site.
+             if s.read(base+0xd0f7c,4)!=bytes.fromhex('e81b40f9'):
+              # Text is normally absent from the compact dump. Use the locally pinned file
+              # below rather than infer that a missing text page was zero.
+              raise ValueError('Native PE code differs')
+            except KeyError:pass
+            try:
+             tids={c['tid'] for c in contexts if c['kind']=='w'}
+             for q in range(256):
+              head=heads+q*24;node=s.u64(head);seen=set()
+              while node and node!=head and len(seen)<16 and node not in seen:
+               seen.add(node);nxt,prev,address=struct.unpack('<QQQ',s.read(node,24));tid=struct.unpack('<I',s.read(node+24,4))[0]
+               if tid in tids and address and (address>>4)&255==q:
+                sp=node-32;caller=s.u64(sp+0x70);kind='direct';offset=None;lock=address
+                for rva,k,off,delta in [(0xd0d30,'srw-exclusive',0x28,2),(0xd1098,'srw-shared',0x18,0),(0xd1530,'cv-cs',0x28,0),(0xd16dc,'cv-srw',0x58,0),(0xd1768,'cv-reacquire-exclusive',0x58,2),(0xd17b0,'cv-reacquire-shared',0x58,0)]:
+                 if caller==base+rva:kind=k;offset=off;lock=address-delta;break
+                w={'tid':tid,'address':hex(address),'caller':name(caller),'kind':kind,'lock':hex(lock)}
+                if offset is not None:w['upper_callsite']=name(s.u64(sp+0x80+offset))
+                try:w['lock_word64']=hex(s.u64(lock))
+                except KeyError:missing.append('lock value '+hex(lock))
+                waits.append(w)
+               node=nxt
+            except KeyError as e:missing.append(str(e))
+           build=next((body.rstrip(b'\0').decode(errors='replace') for typ,tag,addr,body in s.records if typ==5),'unknown')
+           return {'build_id':build,'truncated':bool(s.flags),'record_count':len(s.records),'module_count':len(s.modules),'contexts':contexts,'waits':waits,'missing':missing,
+            'root_cause_proven':False,'note':'Saved memory can be queried again offline; SRW lock values alone do not identify an owner.'}
+          
+          if __name__=='__main__':
+           p=argparse.ArgumentParser(description=__doc__);p.add_argument('dump',type=Path);p.add_argument('--symbols',type=Path,default=Path(__file__).with_name('symbols'));p.add_argument('--output',type=Path);p.add_argument('--read',nargs=2,metavar=('ADDRESS','SIZE'))
+           a=p.parse_args();s=Snapshot(a.dump)
+           if a.read:print(s.read(int(a.read[0],0),int(a.read[1],0)).hex());raise SystemExit()
+           result=json.dumps(analyze(s,a.symbols),indent=2,ensure_ascii=False)+'\n'
+           if a.output:a.output.write_text(result)
+           else:print(result,end='')
+          P3R_UNIFIED_FILE_14_END
+          cat > "$CLOUD_ROOT/p3r-source/pe_symbols.py" <<'P3R_UNIFIED_FILE_15_END'
+          #!/usr/bin/env python3
+          """Read retained COFF symbols from the exact runtime DLL; never execute PE code."""
+          import argparse,bisect,hashlib,json,re,struct,subprocess
+          from pathlib import Path
+          
+          def table(path):
+           data=Path(path).read_bytes();pe=struct.unpack_from('<I',data,60)[0]
+           if data[:2]!=b'MZ' or data[pe:pe+4]!=b'PE\0\0':raise ValueError('not PE')
+           count=struct.unpack_from('<H',data,pe+6)[0];syms,n=struct.unpack_from('<II',data,pe+12)
+           opt=struct.unpack_from('<H',data,pe+20)[0];sect=pe+24+opt
+           sections=[]
+           for i in range(count):
+            off=sect+i*40
+            vs,rva,rs,ro=struct.unpack_from('<IIII',data,off+8)
+            sections.append({'name':data[off:off+8].rstrip(b'\0').decode(),'rva':rva,'vsize':vs,'rawsize':rs,'offset':ro})
+           strings=syms+n*18
+           if not syms or not n or syms+n*18+4>len(data):raise ValueError('COFF symbols absent or truncated')
+           rows=[];i=0
+           while i<n:
+            off=syms+i*18;raw=data[off:off+8]
+            if raw[:4]==b'\0'*4:
+             p=strings+struct.unpack_from('<I',raw,4)[0];end=data.find(b'\0',p)
+             if end<0:raise ValueError('bad COFF string')
+             name=data[p:end].decode(errors='replace')
+            else:name=raw.rstrip(b'\0').decode(errors='replace')
+            value,section,typ,cls,aux=struct.unpack_from('<IhHBB',data,off+8)
+            if 0<section<=len(sections):
+             rows.append({'name':name,'address':value+sections[section-1]['rva'],'function':bool(typ&32),'section':section})
+            i+=1+aux
+           rows.sort(key=lambda r:(r['address'], not r['name'].startswith('#'),len(r['name'])))
+           return {'sha256':hashlib.sha256(data).hexdigest(),'image_size':struct.unpack_from('<I',data,pe+24+56)[0],'sections':sections,'symbols':rows}
+          
+          def resolve(t,address,functions=True):
+           rows=[r for r in t['symbols'] if r['function'] or not functions]
+           starts=[r['address'] for r in rows];index=bisect.bisect_right(starts,address)-1
+           if index<0:return None
+           start=starts[index]
+           while index and starts[index-1]==start:index-=1
+           r=rows[index]
+           return {'rva':hex(address),'name':r['name'],'offset':hex(address-r['address'])}
+          
+          if __name__=='__main__':
+           p=argparse.ArgumentParser(description=__doc__);p.add_argument('dll',type=Path);p.add_argument('--profile',type=Path);p.add_argument('--output',type=Path)
+           args=p.parse_args();t=table(args.dll)
+           if args.profile:
+            text=args.profile.read_text(errors='replace')
+            values=sorted(set(int(x,16) for x in re.findall(re.escape(args.dll.name)+r'\+(0x[0-9a-fA-F]+)',text)))
+            result={'sha256':t['sha256'],'module':args.dll.name,'note':'profiler bucket offsets are approximate locations, not a backtrace', 'resolved':[resolve(t,x) for x in values]}
+           else:result=t
+           out=json.dumps(result,indent=2)+'\n'
+           if args.output:args.output.write_text(out)
+           else:print(out,end='')
+          P3R_UNIFIED_FILE_15_END
+          cat > "$CLOUD_ROOT/p3r-source/test_dump.c" <<'P3R_UNIFIED_FILE_16_END'
+          #include <assert.h>
+          #include <stdio.h>
+          #include <stdint.h>
+          #include "p3r_dump.h"
+          static unsigned char source[128];
+          static int query(uint64_t a,uint64_t *b,uint64_t *n,unsigned *p,unsigned *t){
+           *b=(uintptr_t)source;*n=sizeof(source);*p=1;*t=3;
+           return a>=*b&&a-*b<*n;
+          }
+          int main(void){
+           unsigned char buffer[1024];struct p3r_dump d;struct p3r_dump_header h;unsigned char read[8];
+           memset(source,0x5a,sizeof(source));p3r_dump_begin(&d,buffer,sizeof(buffer),123);
+           assert(!p3r_dump_read(query,UINT64_MAX-2,read,8));assert(p3r_dump_read(query,(uintptr_t)source,read,8));
+           p3r_dump_memory(&d,query,(uintptr_t)source,128,10);p3r_dump_end(&d);memcpy(&h,buffer,sizeof(h));
+           assert(h.records==1 && h.bytes==sizeof(h)+24+128 && !h.flags);
+           assert(!p3r_dump_add(&d,2,0,0,source,UINT64_MAX) && d.truncated);
+           p3r_dump_begin(&d,buffer,8,1);assert(d.truncated && !d.used);
+           puts("PASS: bounded binary records, overflow rejection, exact readable extent and final size metadata");return 0;
+          }
+          P3R_UNIFIED_FILE_16_END
+          cat > "$CLOUD_ROOT/p3r-source/test_autopsy.c" <<'P3R_UNIFIED_FILE_17_END'
+          #include <assert.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <pthread.h>
+          #ifdef __SWITCH__
+          #include <switch.h>
+          #else
+          typedef uint32_t Handle,u32,Result;
+          typedef struct {uint64_t addr,size;unsigned perm,type;} MemoryInfo;
+          typedef struct {uint64_t regs[29],fp,lr,sp,pc;} ThreadContext;
+          #define R_FAILED(x) ((x)!=0)
+          #define R_SUCCEEDED(x) ((x)==0)
+          #define ThreadActivity_Paused 1
+          #define ThreadActivity_Runnable 0
+          static unsigned paused_count,opens,logs;
+          static uint64_t fake_tick=1;
+          static unsigned char guest_stack[256*1024],teb_memory[8192],cpu_memory[16384];
+          static unsigned char peb_mem[4096],ldr_mem[4096],entry_mem[256],module_mem[4096];
+          static uint16_t module_name[64];
+          static Handle threadGetCurHandle(void){return 99;}
+          static uint64_t armGetSystemTick(void){return fake_tick;}
+          static uint64_t armTicksToNs(uint64_t t){return t;}
+          static Result svcSetThreadActivity(Handle h,unsigned state){assert(h==1||h==2);if(state==1)paused_count++;else {assert(paused_count);paused_count--;}return 0;}
+          static Result svcGetThreadContext3(ThreadContext *c,Handle h){(void)h;assert(paused_count);memset(c,0,sizeof(*c));c->sp=(uintptr_t)guest_stack;return 0;}
+          static Result svcQueryMemory(MemoryInfo *m,u32 *page,uint64_t at){
+           const uintptr_t bases[]={(uintptr_t)guest_stack,(uintptr_t)teb_memory,(uintptr_t)cpu_memory,(uintptr_t)peb_mem,(uintptr_t)ldr_mem,(uintptr_t)entry_mem,(uintptr_t)module_mem,(uintptr_t)module_name};
+           const uint64_t sizes[]={sizeof(guest_stack),sizeof(teb_memory),sizeof(cpu_memory),sizeof(peb_mem),sizeof(ldr_mem),sizeof(entry_mem),sizeof(module_mem),sizeof(module_name)};unsigned i;(void)page;
+           for(i=0;i<sizeof(bases)/sizeof(bases[0]);i++)if(at>=bases[i]&&at-bases[i]<sizes[i]) {m->addr=bases[i];m->size=sizes[i];m->perm=1;m->type=3;return 0;}
+           return 1;
+          }
+          static FILE *checked_open(const char *path,const char *mode){assert(!paused_count);assert(strstr(path,"p3r-autopsy-"));assert(!strcmp(mode,"wb"));opens++;return getenv("P3R_TEST_DUMP")?fopen(getenv("P3R_TEST_DUMP"),"wb"):tmpfile();}
+          static size_t checked_write(const void *p,size_t s,size_t n,FILE *f){assert(!paused_count);return fwrite(p,s,n,f);}
+          #define fopen checked_open
+          #define fwrite checked_write
+          #endif
+          #define NX_PROF_MAX_THREADS 128
+          #define P3R_UNIFIED_BUILD_ID "test-unified"
+          static pthread_mutex_t profile_mutex=PTHREAD_MUTEX_INITIALIZER;
+          static struct {Handle handle;unsigned tid;char kind;uint64_t teb;} registry[NX_PROF_MAX_THREADS];
+          static uintptr_t runtime_base=0x12345000;
+          static void wine_nx_runtime_trace(const char *s){
+          #ifndef __SWITCH__
+           assert(!paused_count);assert(strstr(s,"[P3R-AUTOPSY]"));logs++;
+          #else
+           (void)s;
+          #endif
+          }
+          #include "p3r_autopsy.inc"
+          #ifndef __SWITCH__
+          int main(void){
+           uint64_t ptr=(uintptr_t)cpu_memory,top=(uintptr_t)guest_stack+sizeof(guest_stack),bottom=(uintptr_t)guest_stack;
+           memcpy(teb_memory+0x1788,&ptr,8);memcpy(teb_memory+8,&top,8);memcpy(teb_memory+16,&bottom,8);
+           {uint64_t peb=(uintptr_t)peb_mem,ldr=(uintptr_t)ldr_mem,entry=(uintptr_t)entry_mem,base=(uintptr_t)module_mem,name=(uintptr_t)module_name,head=ldr+16;
+            uint32_t size=sizeof(module_mem);uint16_t length=18;unsigned i;
+            for(i=0;i<10;i++)module_name[i]=(unsigned char)"ntdll.dll"[i];
+            memcpy(teb_memory+0x60,&peb,8);memcpy(peb_mem+0x18,&ldr,8);memcpy(ldr_mem+16,&entry,8);
+            memcpy(entry_mem,&head,8);memcpy(entry_mem+0x30,&base,8);memcpy(entry_mem+0x40,&size,4);
+            memcpy(entry_mem+0x58,&length,2);memcpy(entry_mem+0x60,&name,8);
+           }
+           registry[0].handle=1;registry[0].tid=4;registry[0].kind='w';registry[0].teb=(uintptr_t)teb_memory;
+           registry[1].handle=2;registry[1].kind='s';
+           wine_nx_p3r_autopsy(4,(uintptr_t)guest_stack,(uintptr_t)guest_stack+8);
+           assert(!paused_count && opens==1 && logs==1);
+           wine_nx_p3r_autopsy(4,0,0);assert(opens==1);
+           fake_tick+=30000000000ULL;wine_nx_p3r_autopsy(4,0,0);assert(opens==2 && !paused_count);
+           fake_tick+=30000000000ULL;wine_nx_p3r_autopsy(4,0,0);assert(opens==2);
+           puts("PASS: paused-thread capture resumes all targets before file IO/logging; bounded two snapshots and timing guard");return 0;
+          }
+          #endif
+          P3R_UNIFIED_FILE_17_END
+          cat > "$CLOUD_ROOT/p3r-source/test_usb.py" <<'P3R_UNIFIED_FILE_18_END'
+          #!/usr/bin/env python3
+          import hashlib,importlib.util,json,struct,tempfile
+          from pathlib import Path
+          from zipfile import ZipFile
+          import usb_station as station
+          from analyze_dump import Snapshot
+          
+          def run(output):
+           output.mkdir(parents=True,exist_ok=True)
+           with tempfile.TemporaryDirectory(dir=output) as tmp:
+            tmp=Path(tmp);sd=tmp/'SD';wine=sd/'switch/wine';(wine/'logs').mkdir(parents=True)
+            old=b'old-runtime';target=wine/'wine-nx-runtime.nro';target.write_bytes(old)
+            (wine/'logs/P3R_profiler.log').write_text('P3R log')
+            (wine/'logs/OtherGame.log').write_text('not requested')
+            (wine/'logs/stderr.txt').symlink_to(wine/'logs/OtherGame.log')
+            folder,archive=station.collect(sd,tmp/'sessions')
+            with ZipFile(archive) as z:
+             assert 'P3R_profiler.log' in z.namelist() and 'OtherGame.log' not in z.namelist() and 'stderr.txt' not in z.namelist()
+            data=bytearray(256);data[16:20]=b'NRO0';data[32:32+len(b'[P3R-AUTOPSY]')]=b'[P3R-AUTOPSY]'
+            runtime=tmp/'runtime.zip'
+            with ZipFile(runtime,'w') as z:z.writestr(station.NRO_MEMBER,data)
+            expected=hashlib.sha256(data).hexdigest()
+            mtp_file=station.prepare_mtp(runtime,{'native_runtime_sha256':expected},tmp/'sessions')
+            assert mtp_file.read_bytes()==data and target.read_bytes()==old
+            mtp_folder,mtp_archive=station.collect_logs(wine/'logs',tmp/'mtp-sessions')
+            with ZipFile(mtp_archive) as z:
+             assert 'P3R_profiler.log' in z.namelist() and 'OtherGame.log' not in z.namelist()
+            try:station.install(sd,runtime,{'native_runtime_sha256':'0'*64},tmp/'sessions')
+            except ValueError:pass
+            else:raise AssertionError('Hash mismatch accepted')
+            assert target.read_bytes()==old
+            result=station.install(sd,runtime,{'native_runtime_sha256':expected},tmp/'sessions')
+            assert result['changed'] and target.read_bytes()==data and Path(result['backup']).read_bytes()==old
+            assert not station.install(sd,runtime,{'native_runtime_sha256':expected},tmp/'sessions')['changed']
+            with ZipFile(runtime,'w') as z:z.writestr(station.NRO_MEMBER,data);z.writestr('../bad','bad')
+            try:station.install(sd,runtime,{'native_runtime_sha256':expected},tmp/'sessions')
+            except ValueError:pass
+            else:raise AssertionError('Extra archive member accepted')
+            assert target.read_bytes()==data
+            # Actual binary-format parser rejects incomplete copies and oversized records.
+            dump=tmp/'test.p3rdump';body=b'test-build\0';record=struct.pack('<IIQQ',5,0,0x1000000,len(body))+body
+            dump.write_bytes(struct.pack('<8sIIQQQ',b'P3RDMP1\0',1,1,1,0,40+len(record))+record)
+            assert Snapshot(dump).records[0][3]==body
+            dump.write_bytes(dump.read_bytes()[:-1])
+            try:Snapshot(dump)
+            except ValueError:pass
+            else:raise AssertionError('Truncated snapshot accepted')
+            print('PASS: USB/MTP import allowlist/symlinks, local MTP preparation without SD writes, ZIP readback, hash mismatch leaves old NRO intact, verified backup, atomic single-NRO replacement, duplicate skip, rogue ZIP rejection, incomplete dump rejection')
+          if __name__=='__main__':
+           import argparse
+           p=argparse.ArgumentParser();p.add_argument('output',type=Path);a=p.parse_args();run(a.output)
+          P3R_UNIFIED_FILE_18_END
+          cat > "$CLOUD_ROOT/p3r-source/test_unified.py" <<'P3R_UNIFIED_FILE_19_END'
+          #!/usr/bin/env python3
+          import argparse,json,os,subprocess
+          from pathlib import Path
+          
+          def run(source,output):
+           output.mkdir(parents=True,exist_ok=True);cc=os.environ.get('CC','cc');checks=[]
+           for name in ['dump','autopsy']:
+            binary=output/('test_'+name)
+            subprocess.run([cc,'-std=c11','-O2','-Wall','-Wextra','-Werror','-pthread','-I',str(source),str(source/('test_'+name+'.c')),'-o',str(binary)],check=True)
+            env=dict(os.environ)
+            if name=='autopsy':env['P3R_TEST_DUMP']=str((output/'captured-native.p3rdump').resolve())
+            checks.append(subprocess.check_output([str(binary)],text=True,env=env).strip())
+           from analyze_dump import Snapshot,analyze
+           captured=Snapshot(output/'captured-native.p3rdump')
+           decoded=analyze(captured,output/'no-symbols')
+           assert decoded['build_id']=='test-unified' and {x['tid'] for x in decoded['contexts']}=={0,4}
+           assert decoded['module_count']==1 and captured.modules[0]['name']=='ntdll.dll'
+           assert any(tag==13 for typ,tag,addr,body in captured.records if typ==2)
+           checks.append('PASS: native capture writer -> offline Python parser, thread contexts and CPU area roundtrip')
+           subprocess.run([__import__('sys').executable,str(source/'test_usb.py'),str(output/'usb')],check=True)
+           checks.append('PASS: USB station and offline parser regression tests')
+           (output/'UNIFIED-CHECKS.json').write_text(json.dumps({'checks':checks,'switch_execution_verified':False},indent=2)+'\n')
+           print('\n'.join(checks))
+          if __name__=='__main__':
+           p=argparse.ArgumentParser();p.add_argument('source',type=Path);p.add_argument('output',type=Path);a=p.parse_args();run(a.source,a.output)
+          P3R_UNIFIED_FILE_19_END
           python3 "$CLOUD_ROOT/p3r-source/patch_runtime.py" "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/p3r-source/p3r_wait_diag.h" "$CLOUD_ROOT/diagnostics" --build-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           python3 "$CLOUD_ROOT/p3r-source/run_checks.py" "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT/p3r-source" "$CLOUD_ROOT/diagnostics/host-checks"
+          python3 "$CLOUD_ROOT/p3r-source/test_unified.py" "$CLOUD_ROOT/p3r-source" "$CLOUD_ROOT/diagnostics/unified-checks"
 
       - name: Ensure Linux LLVM tools before compilation
         run: |
@@ -1138,7 +2259,7 @@ jobs:
             autorun/horizon-wine/toolchains/boot-payloads/bundle
           key: autorun-tools-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.AUTORUN_REVISION }}-2f1c7e14e601
 
-      - name: Validate NRO-only update and matching native symbols
+      - name: Package one debugger bundle with exact symbols and USB station
         run: |
           set -euo pipefail
           python3 "$CLOUD_ROOT/p3r-source/collect_runtime.py" "$GITHUB_WORKSPACE/autorun" "$CLOUD_ROOT" "$WINE_NX_LLVM_MINGW" 2>&1 | tee "$CLOUD_ROOT/diagnostics/package-check.log"
@@ -1158,12 +2279,12 @@ jobs:
             fi
           done
 
-      - name: Downloadable NRO-only runtime update
+      - name: Downloadable complete P3R debugger
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: autorun-p3r-runtime-${{ github.run_id }}
-          path: cloud-work/dist/
+          name: autorun-p3r-debugger-${{ github.run_id }}
+          path: cloud-work/download/
           retention-days: 30
           compression-level: 0
           if-no-files-found: error
@@ -1177,12 +2298,3 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Downloadable native symbols for this exact NRO
-        if: success()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: autorun-p3r-symbols-${{ github.run_id }}
-          path: cloud-work/symbols/
-          retention-days: 30
-          compression-level: 6
-          if-no-files-found: error
